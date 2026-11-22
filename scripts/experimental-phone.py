@@ -10,37 +10,20 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "05c050661162801d911254582f94d7f778ad4b76"
-SOURCE = "7d30dccbdaf8d909c1076c26e300f79bff3192ad"
-APP_TREE = "c47520346fd94f10b0f046e5cc69d4e35686a58a"
-BASE_APP_TREE = "94f651f8755c62b875738636887d48725c25da4f"
-CORE_TREE = "37d61c523f20a7cdef3f0f609db07e7463edbcdb"
+SOURCE_BASE = "7d30dccbdaf8d909c1076c26e300f79bff3192ad"
+SOURCE = "91d2a4126400fa3aed51ddd3b10fa89e24ad5c94"
+APP_TREE = "e4a29891959488c7d4586316de2836800c98b60b"
+BASE_APP_TREE = "c47520346fd94f10b0f046e5cc69d4e35686a58a"
+CORE_TREE = "b672024572648e467804011d8f270c2177ec7c6b"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
     '.github/workflows/loop-picture-recovery.yml',
-    'ios/OfflineTikTokPlayer.xcodeproj/project.pbxproj',
-    'ios/OfflineTikTokPlayer/App/AppModel.swift',
-    'ios/OfflineTikTokPlayer/App/OfflineTikTokPlayerApp.swift',
     'ios/OfflineTikTokPlayer/Playback/ContinuousPictureInPicture.swift',
-    'ios/OfflineTikTokPlayer/Playback/PlaybackBuffer.swift',
+    'ios/OfflineTikTokPlayer/Playback/IsolatedVideoRecovery.swift',
     'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
-    'ios/OfflineTikTokPlayer/Playback/StreamingVideoFrames.swift',
-    'ios/OfflineTikTokPlayer/UI/FeedView.swift',
-    'ios/OfflineTikTokPlayerTests/AudioOnlyContinuityTests.swift',
-    'ios/OfflineTikTokPlayerTests/ContinuousPictureInPictureTests.swift',
-    'ios/OfflineTikTokPlayerTests/NativeMediaTests.swift',
-    'ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift',
     'ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift',
-    'ios/OfflineTikTokPlayerTests/PlaybackContinuityTests.swift',
-    'ios/OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests.swift',
-    'ios/OfflineTikTokPlayerTests/StreamingVideoFramesTests.swift',
-    'ios/OfflineTikTokPlayerTests/VideoPresentationContinuityTests.swift',
-    'ios/OfflineTikTokPlayerUITests/PlayerShellTests.swift',
-    'ios/PlayerCore/Sources/PlayerCore/VideoImageProgress.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/VideoImageProgressTests.swift',
-    'scripts/capture-simulator-test-frames.py',
-    'scripts/verify-held-picture-results.py',
-    'tests/validation-shell/test_simulator_destination_resolution.py',
+    'ios/PlayerCore/Sources/PlayerCore/VideoClockSync.swift',
+    'ios/PlayerCore/Tests/PlayerCoreTests/VideoClockSyncTests.swift',
 )
 REPOSITORY = "Galaxybigbird/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -124,7 +107,7 @@ def validate_context(environment, event, *, signing=False, linux_preflight=False
     require(re.fullmatch(r"[1-9][0-9]{0,3}(?:\.(?:0|[1-9][0-9]?)){0,2}", build) is not None,
             "An Apple-checked increasing build number is required.")
     numbers = tuple(map(int, build.split("."))) + (0,) * (3 - len(build.split(".")))
-    require(numbers > (36, 1, 0), "Apple must confirm this build follows 36.1 and every newer version.")
+    require(numbers > (37, 1, 0), "Apple must confirm this build follows 37.1 and every newer version.")
     require(not environment.get("APPLE_PRIVATE_DELIVERY"), "The private aggregate secret is not used here.")
     if signing:
         require(environment.get("RELEASE_ENVIRONMENT") == "release", "The existing protected release environment is required.")
@@ -258,8 +241,9 @@ NATIVE_PROOFS = (
     (43671735898, "28bf19eefec7485defd37bc448f63dcb32797295", ".github/workflows/smooth-picture.yml", "codex/smooth-picture"),
     (43703259303, "566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36", ".github/workflows/loop-picture-recovery.yml", "codex/verified-loop-picture"),
     (44491036531, "c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf", ".github/workflows/loop-picture-recovery.yml", "codex/personal-playback-verified"),
-    (44679911846, SOURCE_BASE, ".github/workflows/loop-picture-recovery.yml", "codex/restore-video-queue"),
-    (44717676441, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/verify-current-player-startup"),
+    (44679911846, "05c050661162801d911254582f94d7f778ad4b76", ".github/workflows/loop-picture-recovery.yml", "codex/restore-video-queue"),
+    (44717676441, SOURCE_BASE, ".github/workflows/loop-picture-recovery.yml", "codex/verify-current-player-startup"),
+    (45045299298, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/smooth-synced-video"),
 )
 
 
