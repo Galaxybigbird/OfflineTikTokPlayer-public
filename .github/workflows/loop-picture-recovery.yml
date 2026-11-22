@@ -1,7 +1,7 @@
-name: Verify held video frames, loop audio and cold launch
+name: Verify smooth A/V sync, picture continuity and recovery
 on:
   push:
-    branches: [codex/verify-current-player-startup]
+    branches: [codex/smooth-synced-video]
 permissions:
   contents: read
 jobs:
@@ -9,7 +9,6 @@ jobs:
     if: github.repository == 'Galaxybigbird/OfflineTikTokPlayer-public' && !github.event.repository.private
     permissions:
       contents: read
-      actions: read
     runs-on: ubuntu-24.04
     timeout-minutes: 9
     steps:
@@ -17,49 +16,27 @@ jobs:
         with:
           fetch-depth: 3
           persist-credentials: false
-      - name: Verify the 35 existing XCTest results against the identical runtime and fixtures
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Verify audio engine and frame-request baselines stayed untouched
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin 5ff22edfaa2de9bab12f63ffc7a1ddc7b2e76246
-          api=repos/Galaxybigbird/OfflineTikTokPlayer-public/actions
-          gh api "$api/runs/44714238152" > "$RUNNER_TEMP/previous-run.json"
-          gh api "$api/runs/44714238152/jobs" > "$RUNNER_TEMP/previous-jobs.json"
-          # The log includes ANSI colors. Never print its raw terminal controls.
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            -o "$RUNNER_TEMP/previous-native.log" "https://api.github.com/$api/jobs/136214095858/logs"
-          python3 -B scripts/verify-held-picture-results.py "$RUNNER_TEMP/previous-run.json" "$RUNNER_TEMP/previous-jobs.json" "$RUNNER_TEMP/previous-native.log"
-      - name: Reproduce the shipped half-second blind spot and check the audio baseline
-        run: |
-          set -euo pipefail
-          shipped=05c050661162801d911254582f94d7f778ad4b76
-          git diff --exit-code "$shipped" HEAD -- ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift ios/PlayerCore/Sources/PlayerCore/{ContinuousPCMRenderer,VideoFrameRequest}.swift
-          probe="$RUNNER_TEMP/shipped-picture-progress.swift"
-          git show "$shipped:ios/PlayerCore/Sources/PlayerCore/VideoImageProgress.swift" > "$probe"
-          cat >> "$probe" <<'SWIFT'
-          var watch = VideoImageProgress()
-          var firstIntervention: Double?
-          for tick in 0...240 {
-              let t = Double(tick) / 60
-              let elapsed = t - 1
-              if watch.shouldRecover(now: t, playbackPosition: t, displayedPosition: min(1, t)) {
-                  firstIntervention = elapsed
-                  break
-              }
-          }
-          guard let delay = firstIntervention, delay >= 1.5 else { fatalError("Expected the shipped held-picture behavior") }
-          print("36.1 old code: soundtrack advanced while picture held, first intervention after", delay, "seconds")
-          SWIFT
-          swift "$probe"
+          base=7d30dccbdaf8d909c1076c26e300f79bff3192ad
+          git diff --exit-code "$base" HEAD -- \
+            ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift \
+            ios/OfflineTikTokPlayer/Playback/ContinuousAudioGraph.swift \
+            ios/PlayerCore/Sources/PlayerCore/ContinuousPCMRenderer.swift \
+            ios/PlayerCore/Sources/PlayerCore/VideoFrameRequest.swift \
+            scripts/private-delivery.py
       - name: Check project, Swift syntax and playback core
         run: |
           set -euo pipefail
           python3 -B scripts/generate-ios-project.py --check
           python3 -B tests/validation-shell/test_simulator_boot_preflight.py
           python3 -B tests/validation-shell/test_simulator_destination_resolution.py
-          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/App/{AppModel,OfflineTikTokPlayerApp}.swift ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture,PlaybackBuffer,PlaybackService,StreamingVideoFrames}.swift ios/OfflineTikTokPlayerTests/{AudioOnlyContinuityTests,ContinuousAudioPlayerTests,ContinuousPictureInPictureTests,NativeMediaTests,NativeStreamingPlaybackTests,PictureRecoveryTests,PlaybackContinuityTests,PlaybackSelectionVideoRegressionTests,StreamingVideoFramesTests,VideoPresentationContinuityTests}.swift ios/OfflineTikTokPlayerUITests/PlayerShellTests.swift
+          swiftc -frontend -parse -D DEBUG \
+            ios/OfflineTikTokPlayer/App/{AppModel,OfflineTikTokPlayerApp}.swift \
+            ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture,IsolatedVideoRecovery,PlaybackBuffer,PlaybackService,StreamingVideoFrames}.swift \
+            ios/OfflineTikTokPlayerTests/{AudioOnlyContinuityTests,ContinuousAudioPlayerTests,ContinuousPictureInPictureTests,NativeMediaTests,NativeStreamingPlaybackTests,PictureRecoveryTests,PlaybackContinuityTests,PlaybackSelectionVideoRegressionTests,StreamingVideoFramesTests,VideoPresentationContinuityTests}.swift \
+            ios/OfflineTikTokPlayerUITests/PlayerShellTests.swift
           bash scripts/test-core.sh
           bash scripts/test-native-cloud.sh
   simulator:
@@ -72,7 +49,7 @@ jobs:
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Verify loop and switch sequences with the simulator compositor
+      - name: Verify smooth A/V sync, framerate cadence and recovery on simulator
         run: |
           set -euo pipefail
           udid="$(python3 -B scripts/capture-simulator-test-frames.py --hosted-inventory --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
@@ -89,9 +66,18 @@ jobs:
           }
           trap cleanup_capture EXIT
           recovery=OfflineTikTokPlayerTests/PictureRecoveryTests
+          continuity=OfflineTikTokPlayerTests/VideoPresentationContinuityTests
+          pip=OfflineTikTokPlayerTests/ContinuousPictureInPictureTests
           selection=OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests
           boot_simulator() {
-            python3 -B scripts/ensure-simulator-booted.py --udid "$udid" --hosted-inventory
+            if ! python3 -B scripts/ensure-simulator-booted.py --udid "$udid" --hosted-inventory; then
+              echo "::warning title=boot_simulator::First simulator boot attempt failed; shutting down and retrying once"
+              xcrun simctl shutdown "$udid" 2>/dev/null || true
+              python3 -B scripts/ensure-simulator-booted.py --udid "$udid" --hosted-inventory || {
+                echo "::error title=boot_simulator::Simulator boot failed after retry"
+                return 1
+              }
+            fi
           }
           start_capture() {
             local capture_log="$work/capture-helper.log"
@@ -108,10 +94,15 @@ jobs:
           }
           build_cases() {
             local phase="$1" project="${2:-ios/OfflineTikTokPlayer.xcodeproj}" derived="${3:-$work/Derived}"
-            xcodebuild build-for-testing -project "$project" -scheme OfflineTikTokPlayer \
+            if ! xcodebuild build-for-testing -project "$project" -scheme OfflineTikTokPlayer \
               -configuration Debug -destination "platform=iOS Simulator,id=$udid" \
               -derivedDataPath "$derived" -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/$work/Derived/SourcePackages" \
-              -jobs 2 CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$phase-build.log" || return
+              -jobs 2 CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$phase-build.log"; then
+              grep -i "error:" "$work/$phase-build.log" | head -n 10 | while IFS= read -r line; do
+                echo "::error title=build::$line"
+              done || true
+              return 1
+            fi
             local plans=("$derived/Build/Products/"*.xctestrun)
             test "${#plans[@]}" = 1 && test -f "${plans[0]}" || return
             plan="${plans[0]}"
@@ -137,10 +128,11 @@ jobs:
               if [[ -d "$work/$phase.xcresult" ]]; then
                 mv "$work/$phase.xcresult" "$work/$phase-bootstrap.xcresult" || return
               fi
+              local had_capture="$capture_pid"
               cleanup_capture
               xcrun simctl shutdown "$udid" || return
               boot_simulator || return
-              start_capture || return
+              if [[ -n "$had_capture" ]]; then start_capture || return; fi
               status=0
               run_once || status=$?
             fi
@@ -149,40 +141,76 @@ jobs:
           check_cases() {
             local phase="$1" result="$2"
             shift 2
+            if [[ ! -d "$work/$phase.xcresult" ]]; then
+              echo "::error title=$phase::Missing xcresult bundle"
+              return 1
+            fi
             xcrun xcresulttool get test-results tests --path "$work/$phase.xcresult" > "$work/$phase.json"
-            python3 - "$work/$phase.json" "$result" "$@" <<'PY'
+            python3 - "$work/$phase.json" "$result" "$phase" "$@" <<'PY'
           import json
           import sys
           from pathlib import Path
 
-          report, result, *selectors = sys.argv[1:]
+          report, result, phase, *selectors = sys.argv[1:]
           expected = {selector.split('/', 1)[1] for selector in selectors}
+          failures = []
           nodes = list(json.loads(Path(report).read_text())['testNodes'])
           while nodes:
               node = nodes.pop()
-              nodes.extend(node.get('children', ()))
+              children = node.get('children', ())
+              nodes.extend(children)
               if node['nodeType'] == 'Test Case':
                   identity = node['nodeIdentifier'].removesuffix('()')
-                  assert identity in expected, node
-                  assert node['result'] == result, node
+                  if identity not in expected:
+                      failures.append(f"unexpected {identity}")
+                      continue
                   expected.remove(identity)
-          assert not expected, expected
+                  if node['result'] != result:
+                      details = []
+                      stack = list(children)
+                      while stack:
+                          child = stack.pop()
+                          stack.extend(child.get('children', ()))
+                          if child.get('nodeType') == 'Failure Message' and child.get('name'):
+                              details.append(child['name'].replace('\n', ' '))
+                      msg = '; '.join(details[:3]) or node['result']
+                      failures.append(f"{identity}: {msg}")
+          for missing in sorted(expected):
+              failures.append(f"missing {missing}")
+          for entry in failures:
+              print(f"::error title={phase}::{entry[:300]}")
+          assert not failures, failures
           print(Path(report).stem, result, len(selectors))
           PY
           }
           run_checked() {
             local phase="$1"
             shift
-            run_cases "$phase" "$@" && check_cases "$phase" Passed "$@"
+            local rc=0
+            run_cases "$phase" "$@" || rc=$?
+            if [[ -f "$work/$phase.log" ]]; then
+              grep -E '(SMOOTH_SEEK_TEST|MODERATE_DRIFT_TEST|PRODUCTION_HD deliveredFPS|VIDEO_PRESENTATION )' "$work/$phase.log" | head -n 8 | while IFS= read -r line; do
+                echo "::notice title=$phase::${line:0:300}"
+              done || true
+            fi
+            check_cases "$phase" Passed "$@" || rc=1
+            return "$rc"
           }
           boot_simulator
           build_cases Fixed
-          start_capture
-          # Run the outstanding test with a fresh host, then after loop and
-          # rapid-switch activity. Both tests in the edited suite execute here.
           gate_status=0
-          run_checked Cold "$selection/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption" || gate_status=1
-          run_checked AfterChurn "$recovery/testRepeatedLoopsAndRapidReversalsKeepDisplayingTheCurrentVideo" \
+          # Run smooth A/V sync proofs first (also warming the simulator host), then
+          # measure full-resolution 1080p60 cadence in its own clean fresh process
+          # without the capture helper active (matching native-video-final.yml).
+          run_checked SmoothSync \
+            "$recovery/testSlowHardwareSeekResumesSmoothlyWithoutSeekLoop" \
+            "$recovery/testModerateDriftRateMatchesSmoothlyWithoutSeeking" || gate_status=1
+          start_capture
+          run_checked CoreRecoveryAndSelection \
+            "$recovery/testMovingPictureRecoversBeforeHalfASecondWhileAudioAdvances" \
+            "$recovery/testPictureFeedRecoversTwiceWithinTheSamePlayingVisit" \
+            "$recovery/testNativeAudioOwnerRecoversAgainAfterPauseWithoutSeekingTheAudiblePlayer" \
+            "$recovery/testRepeatedLoopsAndRapidReversalsKeepDisplayingTheCurrentVideo" \
             "$selection/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption" \
             "$selection/testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause" || gate_status=1
           exit "$gate_status"

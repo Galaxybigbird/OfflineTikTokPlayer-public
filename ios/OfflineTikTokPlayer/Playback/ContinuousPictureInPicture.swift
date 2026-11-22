@@ -994,6 +994,7 @@ final class ContinuousPictureInPicture: NSObject {
                 }
                 self.currentResource = resource; self.currentResourceOwned = true; self.videoOutput = output
                 self.orientationPrepared = true
+                self.updateDisplayLinkFrameRate()
                 self.renderFrame()
                 if self.presentationActive && self.frameFeedEnabled && self.playbackState.read().isPlaying { self.startFrameTimer() }
                 self.onEvent?(.sourcePrepared, nil)
@@ -1010,7 +1011,8 @@ final class ContinuousPictureInPicture: NSObject {
     /// can update this state, but cannot authorize a newly adopted presentation.
     @discardableResult
     func installTimeline(_ ticket: PresentationTicket, positionSeconds: Double,
-                         durationSeconds: Double, isPlaying: Bool, atHostTime: CMTime? = nil) -> Bool {
+                         durationSeconds: Double, isPlaying: Bool, atHostTime: CMTime? = nil,
+                         displayPositionSeconds: Double? = nil, displayRate: Float = 1.0) -> Bool {
         guard owns(ticket) else { return false }
         let host = atHostTime ?? CMClockGetTime(CMClockGetHostTimeClock())
         beginReadinessUpdates()
@@ -1020,7 +1022,8 @@ final class ContinuousPictureInPicture: NSObject {
         installedTimeline = nil
         stopFrameTimer()
         applyPlayback(positionSeconds: positionSeconds, durationSeconds: durationSeconds,
-                      isPlaying: isPlaying, forceAnchor: true, atHostTime: host)
+                      isPlaying: isPlaying, forceAnchor: true, atHostTime: host,
+                      displayPositionSeconds: displayPositionSeconds, displayRate: displayRate)
         guard owns(ticket), seekTicket == seek, activeSeekTicket == activeSeek else { return false }
         installedTimeline = ticket
         return true
@@ -1098,8 +1101,11 @@ final class ContinuousPictureInPicture: NSObject {
         guard !decoder.isAligning, decoder.player.currentItem === decoder.item,
               let audioClock = audibleItem.timebase, let videoClock = decoder.item.timebase else { return false }
         let audioRate = CMTimebaseGetEffectiveRate(audioClock), videoRate = CMTimebaseGetEffectiveRate(videoClock)
-        guard audioRate.isFinite, videoRate.isFinite, audioRate > 0, videoRate > 0,
-              abs(audioRate - videoRate) < 0.01 else { return false }
+        guard audioRate.isFinite, videoRate.isFinite, audioRate > 0, videoRate > 0 else { return false }
+        let rateAligned = abs(audioRate - videoRate) < 0.01
+            || (videoRate >= Double(VideoClockSync.minRate) - 0.01
+                && videoRate <= Double(VideoClockSync.maxRate) + 0.01)
+        guard rateAligned else { return false }
         let host = CMClockGetHostTimeClock(), now = CMClockGetTime(host)
         let audio = CMSyncConvertTime(now, from: host, to: audioClock)
         let video = CMSyncConvertTime(now, from: host, to: videoClock)
@@ -1256,13 +1262,22 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     /// Position must come from the audio renderer, not the independently muted video player.
-    func updatePlayback(positionSeconds: Double, durationSeconds: Double, isPlaying: Bool) {
+    /// During smooth muted rate-matching, `displayPositionSeconds` / `displayRate` keep the
+    /// sample-buffer display clock aligned with the smoothly converging video without flushing.
+    func updatePlayback(positionSeconds: Double, durationSeconds: Double, isPlaying: Bool,
+                        atHostTime: CMTime? = nil,
+                        displayPositionSeconds: Double? = nil, displayRate: Float = 1.0,
+                        preserveDisplayClock: Bool = false) {
         applyPlayback(positionSeconds: positionSeconds, durationSeconds: durationSeconds,
-                      isPlaying: isPlaying, forceAnchor: false)
+                      isPlaying: isPlaying, forceAnchor: false, atHostTime: atHostTime,
+                      displayPositionSeconds: displayPositionSeconds, displayRate: displayRate,
+                      preserveDisplayClock: preserveDisplayClock)
     }
 
     private func applyPlayback(positionSeconds: Double, durationSeconds: Double, isPlaying: Bool,
-                               forceAnchor: Bool, atHostTime: CMTime? = nil) {
+                               forceAnchor: Bool, atHostTime: CMTime? = nil,
+                               displayPositionSeconds: Double? = nil, displayRate: Float = 1.0,
+                               preserveDisplayClock: Bool = false) {
         guard !invalidated else { return }
         let host = atHostTime ?? CMClockGetTime(CMClockGetHostTimeClock())
         beginReadinessUpdates()
@@ -1274,15 +1289,23 @@ final class ContinuousPictureInPicture: NSObject {
         let previous = playbackState.read()
         playbackState.update(position: position, duration: duration, isPlaying: isPlaying)
         if let timebase {
+            let targetDisplay = (displayPositionSeconds.flatMap { $0.isFinite ? max(0, $0) : nil }) ?? position
+            let targetRate = isPlaying
+                ? Double(displayRate.isFinite && displayRate > 0 ? displayRate : 1.0)
+                : 0
             // The audio cursor and native video seek use a 48 kHz sample grid.
             // A 60 kHz Double conversion can land one tick behind a paused seek,
             // making its valid image fail the strict future-frame guard.
-            let frame = (position * 48_000).rounded()
+            let frame = (targetDisplay * 48_000).rounded()
             let anchorTime = frame.isFinite && frame < Double(Int64.max)
                 ? CMTime(value: Int64(frame), timescale: 48_000)
-                : CMTime(seconds: position, preferredTimescale: 48_000)
+                : CMTime(seconds: targetDisplay, preferredTimescale: 48_000)
             let current = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
-            let needsAnchor = forceAnchor || !current.isFinite || abs(current - position) > 0.08
+            let currentRate = CMTimebaseGetRate(timebase)
+            let keepConvergingClock = preserveDisplayClock && isPlaying && !forceAnchor
+                && previous.isPlaying && current.isFinite
+            let needsAnchor = !keepConvergingClock
+                && (forceAnchor || !current.isFinite || abs(current - targetDisplay) > 0.08)
             if needsAnchor {
                 flushForSeek()
                 guard !invalidated, presentationRevision == revision,
@@ -1291,8 +1314,12 @@ final class ContinuousPictureInPicture: NSObject {
             if needsAnchor || previous.isPlaying != isPlaying {
                 // A flush can take longer than a frame. Both the decoder and
                 // display must share the host time of the original position.
-                CMTimebaseSetRateAndAnchorTime(timebase, rate: isPlaying ? 1 : 0,
+                CMTimebaseSetRateAndAnchorTime(timebase, rate: targetRate,
                     anchorTime: anchorTime, immediateSourceTime: host)
+            } else if isPlaying && abs(currentRate - targetRate) >= 0.005 {
+                // Smooth muted rate-matching adjusts the display clock rate in place
+                // without flushing queued frames or invalidating the displayed image.
+                CMTimebaseSetRate(timebase, rate: targetRate)
             } else if !isPlaying {
                 CMTimebaseSetTime(timebase, time: anchorTime)
             }
@@ -1537,6 +1564,13 @@ final class ContinuousPictureInPicture: NSObject {
         onCurrentFrameInvalidated = nil
         onCurrentFrameStateChanged = nil
         onClockAlignmentRequired = nil
+    }
+
+    private func updateDisplayLinkFrameRate() {
+        guard let link = displayLink else { return }
+        let rate = currentResource?.preferredFrameRate ?? 60
+        let sourceRate = currentResource?.sourceFrameRate ?? 30
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: min(rate, max(1, sourceRate)), maximum: rate, preferred: rate)
     }
 
     private func startFrameTimer() {
