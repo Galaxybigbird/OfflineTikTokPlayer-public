@@ -8,6 +8,8 @@ public final class PersonalLibrary {
         static let history = "personalHistory.v1"
         static let liked = "personalLiked.v1"
         static let playlists = "personalPlaylists.v1"
+        static let pinnedPlaylists = "personalPinnedPlaylists.v1"
+        static let lastPlayedPlaylist = "personalLastPlayedPlaylist.v1"
     }
 
     private let defaults: UserDefaults
@@ -16,6 +18,8 @@ public final class PersonalLibrary {
     public private(set) var playlists: [PlaylistRecord]
     public private(set) var likedIDs: Set<String>
     public private(set) var bookmarkedIDs: Set<String>
+    public private(set) var pinnedPlaylistIDs: [String]
+    public private(set) var lastPlayedPlaylistID: String?
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -27,6 +31,51 @@ public final class PersonalLibrary {
         self.playlists = playlists
         likedIDs = Set(liked)
         bookmarkedIDs = Set(playlists.lazy.flatMap(\.itemIDs))
+        pinnedPlaylistIDs = defaults.stringArray(forKey: Key.pinnedPlaylists) ?? []
+        lastPlayedPlaylistID = defaults.string(forKey: Key.lastPlayedPlaylist)
+    }
+
+    public func isPinned(_ playlistID: String) -> Bool {
+        pinnedPlaylistIDs.contains(playlistID)
+    }
+
+    public func togglePin(_ playlistID: String) {
+        guard !playlistID.isEmpty else { return }
+        if let index = pinnedPlaylistIDs.firstIndex(of: playlistID) {
+            pinnedPlaylistIDs.remove(at: index)
+        } else {
+            pinnedPlaylistIDs.insert(playlistID, at: 0)
+        }
+        defaults.set(pinnedPlaylistIDs, forKey: Key.pinnedPlaylists)
+    }
+
+    public func recordPlayedPlaylist(_ playlistID: String?) {
+        let normalized = playlistID?.isEmpty == true ? nil : playlistID
+        guard lastPlayedPlaylistID != normalized else { return }
+        lastPlayedPlaylistID = normalized
+        if let normalized {
+            defaults.set(normalized, forKey: Key.lastPlayedPlaylist)
+        } else {
+            defaults.removeObject(forKey: Key.lastPlayedPlaylist)
+        }
+    }
+
+    public func orderedPlaylists(_ source: [PlaylistRecord]) -> [PlaylistRecord] {
+        var result: [PlaylistRecord] = []
+        var seen = Set<String>()
+        let byID = Dictionary(uniqueKeysWithValues: source.map { ($0.id, $0) })
+        for id in pinnedPlaylistIDs {
+            if let playlist = byID[id], seen.insert(id).inserted {
+                result.append(playlist)
+            }
+        }
+        if let recent = lastPlayedPlaylistID, let playlist = byID[recent], seen.insert(recent).inserted {
+            result.append(playlist)
+        }
+        for playlist in source where seen.insert(playlist.id).inserted {
+            result.append(playlist)
+        }
+        return result
     }
 
     public func recordPlayed(_ mediaID: String) {

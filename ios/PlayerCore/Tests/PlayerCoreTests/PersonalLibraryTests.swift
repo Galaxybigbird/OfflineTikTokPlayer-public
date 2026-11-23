@@ -53,6 +53,37 @@ final class PersonalLibraryTests: XCTestCase {
         XCTAssertEqual(catalog.queue(playlistIDs: ["music"]), ["1", "2"])
     }
 
+    @MainActor
+    func testPinnedAndLastPlayedPlaylistsPersistAndOrderFirst() throws {
+        let (defaults, name) = try isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: name) }
+        let library = PersonalLibrary(defaults: defaults)
+        let first = PlaylistRecord(id: "p1", name: "First", itemIDs: ["1"])
+        let second = PlaylistRecord(id: "p2", name: "Second", itemIDs: ["2"])
+        let third = PlaylistRecord(id: "p3", name: "Third", itemIDs: ["3"])
+        let all = [first, second, third]
+
+        XCTAssertEqual(library.orderedPlaylists(all).map(\.id), ["p1", "p2", "p3"])
+
+        library.recordPlayedPlaylist("p3")
+        XCTAssertEqual(library.orderedPlaylists(all).map(\.id), ["p3", "p1", "p2"])
+
+        library.togglePin("p2")
+        XCTAssertTrue(library.isPinned("p2"))
+        XCTAssertEqual(library.orderedPlaylists(all).map(\.id), ["p2", "p3", "p1"])
+
+        // Persists across reload and ignores unknown/deleted pinned IDs cleanly.
+        let reloaded = PersonalLibrary(defaults: defaults)
+        XCTAssertTrue(reloaded.isPinned("p2"))
+        XCTAssertEqual(reloaded.lastPlayedPlaylistID, "p3")
+        XCTAssertEqual(reloaded.orderedPlaylists(all).map(\.id), ["p2", "p3", "p1"])
+        XCTAssertEqual(reloaded.orderedPlaylists([first, third]).map(\.id), ["p3", "p1"])
+
+        reloaded.togglePin("p2")
+        XCTAssertFalse(reloaded.isPinned("p2"))
+        XCTAssertEqual(PersonalLibrary(defaults: defaults).orderedPlaylists(all).map(\.id), ["p3", "p1", "p2"])
+    }
+
     private func isolatedDefaults() throws -> (UserDefaults, String) {
         let name = "personal-library-tests-\(UUID())"
         return (try XCTUnwrap(UserDefaults(suiteName: name)), name)

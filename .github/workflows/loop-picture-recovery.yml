@@ -1,7 +1,7 @@
-name: Verify smooth A/V sync, picture continuity and recovery
+name: Verify library UI, A/V sync, picture continuity and recovery
 on:
   push:
-    branches: [codex/smooth-video-fix]
+    branches: [codex/library-ui-overhaul]
 permissions:
   contents: read
 jobs:
@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
       - name: Verify audio engine and frame-request baselines stayed untouched
         run: |
@@ -34,6 +34,7 @@ jobs:
           python3 -B tests/validation-shell/test_simulator_destination_resolution.py
           swiftc -frontend -parse -D DEBUG \
             ios/OfflineTikTokPlayer/App/{AppModel,OfflineTikTokPlayerApp}.swift \
+            ios/OfflineTikTokPlayer/UI/{FeedView,LibraryView}.swift \
             ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture,IsolatedVideoRecovery,PlaybackBuffer,PlaybackService,StreamingVideoFrames}.swift \
             ios/OfflineTikTokPlayerTests/{AudioOnlyContinuityTests,ContinuousAudioPlayerTests,ContinuousPictureInPictureTests,NativeMediaTests,NativeStreamingPlaybackTests,PictureRecoveryTests,PlaybackContinuityTests,PlaybackSelectionVideoRegressionTests,StreamingVideoFramesTests,VideoPresentationContinuityTests}.swift \
             ios/OfflineTikTokPlayerUITests/PlayerShellTests.swift
@@ -72,6 +73,7 @@ jobs:
           streaming=OfflineTikTokPlayerTests/NativeStreamingPlaybackTests
           frames=OfflineTikTokPlayerTests/StreamingVideoFramesTests
           selection=OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests
+          shell=OfflineTikTokPlayerUITests/PlayerShellTests
           boot_simulator() {
             if ! python3 -B scripts/ensure-simulator-booted.py --udid "$udid" --hosted-inventory; then
               echo "::warning title=boot_simulator::First simulator boot attempt failed; shutting down and retrying once"
@@ -230,4 +232,9 @@ jobs:
             "$recovery/testRepeatedLoopsAndRapidReversalsKeepDisplayingTheCurrentVideo" \
             "$selection/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption" \
             "$selection/testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause" || gate_status=1
+          cleanup_capture
+          run_checked LibraryShellUI \
+            "$shell/testLibraryAndPlaybackSettingsAreReachable" \
+            "$shell/testPersonalPlaylistPersistsAndActivityHasSeparateDestinations" \
+            "$shell/testColdLaunchClearsSelectionAndBackgroundReturnKeepsIt" || gate_status=1
           exit "$gate_status"

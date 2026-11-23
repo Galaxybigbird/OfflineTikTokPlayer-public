@@ -15,7 +15,11 @@ struct FeedView: View {
                 } description: {
                     Text("Choose a playlist in Library, then play or shuffle. Swipe up for the next video and down to go back.")
                 } actions: {
-                    Button("Open Library") { app.tab = .library }.buttonStyle(.borderedProminent)
+                    Button { app.tab = .library } label: {
+                        Text("Open Library").font(.subheadline.weight(.bold)).foregroundStyle(.black)
+                            .padding(.horizontal, 18).padding(.vertical, 10)
+                            .background(Color.cyan, in: Capsule())
+                    }.buttonStyle(.plain)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 FeedPager(window: playback.feedWindow,
@@ -60,9 +64,87 @@ private struct FeedPage: View {
                 HStack {
                     Button { app.tab = .library } label: { Image(systemName: "chevron.left").frame(width: 44, height: 44) }
                         .accessibilityLabel("Open library")
-                    Spacer()
-                    Text("Your playlists").font(.headline)
-                    Spacer()
+                    Spacer(minLength: 8)
+                    Menu {
+                        let imported = app.personal.orderedPlaylists(app.library.catalog.playlists)
+                        if !imported.isEmpty {
+                            Section("Playlists") {
+                                ForEach(imported) { playlist in
+                                    let selected = app.playback.activeSource == .imported(playlist.id)
+                                    Button {
+                                        app.personal.recordPlayedPlaylist(playlist.id)
+                                        app.playback.start(playlistIDs: [playlist.id],
+                                                           shuffle: app.playback.queue.isShuffled,
+                                                           source: .imported(playlist.id))
+                                    } label: {
+                                        Label(playlist.name, systemImage: selected ? "checkmark" : "music.note.list")
+                                    }
+                                }
+                            }
+                        }
+                        if !app.personal.playlists.isEmpty {
+                            Section("My playlists") {
+                                ForEach(app.personal.playlists) { playlist in
+                                    let selected = app.playback.activeSource == .personal(playlist.id)
+                                    Button {
+                                        app.playback.start(playlistIDs: [],
+                                                           shuffle: app.playback.queue.isShuffled,
+                                                           within: playlist.itemIDs,
+                                                           source: .personal(playlist.id))
+                                    } label: {
+                                        Label(playlist.name, systemImage: selected ? "checkmark" : "bookmark")
+                                    }
+                                }
+                            }
+                        }
+                        Section {
+                            Button {
+                                app.playback.start(playlistIDs: [], shuffle: app.playback.queue.isShuffled, source: .all)
+                            } label: {
+                                Label("All videos", systemImage: app.playback.activeSource == .all ? "checkmark" : "rectangle.stack")
+                            }
+                            if !app.personal.history.isEmpty {
+                                Button {
+                                    app.playback.start(playlistIDs: [], shuffle: app.playback.queue.isShuffled,
+                                                       within: app.personal.history, source: .history)
+                                } label: {
+                                    Label("History", systemImage: app.playback.activeSource == .history ? "checkmark" : "clock.arrow.circlepath")
+                                }
+                            }
+                            if !app.personal.liked.isEmpty {
+                                Button {
+                                    app.playback.start(playlistIDs: [], shuffle: app.playback.queue.isShuffled,
+                                                       within: app.personal.liked, source: .liked)
+                                } label: {
+                                    Label("Liked", systemImage: app.playback.activeSource == .liked ? "checkmark" : "heart.fill")
+                                }
+                            }
+                            if !app.downloads.readyIDs.isEmpty {
+                                Button {
+                                    app.playback.start(playlistIDs: [], shuffle: app.playback.queue.isShuffled,
+                                                       offlineOnly: true, source: .downloads)
+                                } label: {
+                                    Label("Downloads", systemImage: app.playback.activeSource == .downloads ? "checkmark" : "arrow.down.circle")
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(activeSourceTitle)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(.black.opacity(0.42), in: Capsule())
+                        .overlay(Capsule().strokeBorder(.white.opacity(0.18), lineWidth: 1))
+                    }
+                    .disabled(!isActive)
+                    .accessibilityLabel("Switch playlist, currently \(activeSourceTitle)")
+                    Spacer(minLength: 8)
                     Button { app.sheet = .settings } label: { Image(systemName: "gearshape").frame(width: 44, height: 44) }
                         .accessibilityLabel("Settings")
                 }
@@ -115,6 +197,25 @@ private struct FeedPage: View {
                 if isActive { SeekBar(playback: app.playback, mediaID: item.id).id(item.id).padding(.horizontal, 12).padding(.bottom, 6) }
             }
         }.foregroundStyle(.white)
+    }
+
+    private var activeSourceTitle: String {
+        switch app.playback.activeSource {
+        case .all:
+            return "All videos"
+        case .imported(let id):
+            return app.library.catalog.playlists.first(where: { $0.id == id })?.name ?? "Playlist"
+        case .multiple(let ids):
+            return "\(ids.count) playlists"
+        case .personal(let id):
+            return app.personal.playlists.first(where: { $0.id == id })?.name ?? "My playlist"
+        case .history:
+            return "History"
+        case .liked:
+            return "Liked"
+        case .downloads:
+            return "Downloads"
+        }
     }
 
     private var repeatLabel: String {

@@ -773,8 +773,20 @@ final class PlaybackService: NSObject {
     }
     #endif
 
+    enum ActiveSource: Equatable, Sendable {
+        case all
+        case imported(String)
+        case multiple([String])
+        case personal(String)
+        case history
+        case liked
+        case downloads
+    }
+
+    private(set) var activeSource: ActiveSource = .all
+
     func start(playlistIDs: [String], at mediaID: String? = nil, shuffle: Bool = false, offlineOnly: Bool = false,
-               within itemIDs: [String]? = nil) {
+               within itemIDs: [String]? = nil, source: ActiveSource? = nil) {
         let command = beginAudioCommand()
         recordPlaybackEvent("start")
         guard audioCommand == command else { return }
@@ -785,6 +797,19 @@ final class PlaybackService: NSObject {
             return
         }
         guard !ids.isEmpty else { message = "No playable videos here yet. Download this playlist or import local videos."; return }
+        let resolvedSource: ActiveSource
+        if let source {
+            resolvedSource = source
+        } else if offlineOnly && playlistIDs.isEmpty && itemIDs == nil {
+            resolvedSource = .downloads
+        } else if playlistIDs.count == 1 {
+            resolvedSource = .imported(playlistIDs[0])
+        } else if playlistIDs.count > 1 {
+            resolvedSource = .multiple(playlistIDs)
+        } else {
+            resolvedSource = .all
+        }
+        activeSource = resolvedSource
         let repeatMode = queue.repeatMode
         queue = PlaybackQueue(ids: ids, startAt: mediaID, shuffle: shuffle)
         queue.repeatMode = repeatMode
