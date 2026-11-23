@@ -588,6 +588,8 @@ final class PlaybackService: NSObject {
         let audioFrame: Int64
     }
     @ObservationIgnored private var stoppedVideoClock: StoppedVideoClock?
+    @ObservationIgnored private var videoClockSyncActive: (request: Int, rate: Float)?
+    @ObservationIgnored private var lastVideoOutputRepairTime: TimeInterval = 0
     private struct ImageProgressOwner: Equatable {
         let request: Int, item: ObjectIdentifier, token: Int, selectionVersion: Int
     }
@@ -817,6 +819,7 @@ final class PlaybackService: NSObject {
     }
     func pause() {
         beginAudioCommand()
+        videoClockSyncActive = nil
         imageProgressOwner = nil; imageProgress = VideoImageProgress(); lastImageProgressCheck = 0
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
@@ -924,6 +927,7 @@ final class PlaybackService: NSObject {
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming() }
     func seek(_ seconds: Double) {
         beginAudioCommand()
+        videoClockSyncActive = nil
         imageProgressOwner = nil
         imageProgress = VideoImageProgress()
         continuousPiP.beginReadinessUpdates()
@@ -995,6 +999,7 @@ final class PlaybackService: NSObject {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         pendingAudioSeek = nil; nativeSeekTicket = nil; completePiPSkip()
+        videoClockSyncActive = nil
         pendingInitialClockBinding = nil; statusHandledGeneration = nil
         pausedExplicitVisitOwnership = nil
         pendingInitialZeroStart = nil
@@ -1244,6 +1249,7 @@ final class PlaybackService: NSObject {
     /// unavailable. Its boundaries still need gapless validation; it is not PCM acceptance.
     private func setNativeAudioOwner(_ enabled: Bool) {
         let request = generation
+        videoClockSyncActive = nil
         usesNativeAudio = enabled
         if enabled, nativeRateObservation == nil {
             nativeRateObservation = player.observe(\.rate, options: [.new]) { [weak self] _, _ in
@@ -2276,7 +2282,10 @@ final class PlaybackService: NSObject {
                 let ownedInitialVisit = consumeInitialZeroVisit(sample, entry: entry, changedSource: changedSource)
                 let ownedPausedExplicitVisit = consumePausedExplicitVisit(sample, entry: entry)
                 audioVisit = sample.visit; audioToken = sample.token
-                if !ownedInitialVisit && !ownedPausedExplicitVisit { continuousPiP.flushForSeek() }
+                if !ownedInitialVisit && !ownedPausedExplicitVisit {
+                    videoClockSyncActive = nil
+                    continuousPiP.flushForSeek()
+                }
                 continuousAudio.adoptRendered(id: entry.id)
                 if changedSource, entry.id != queue.currentID {
                     var following = queue
@@ -2288,7 +2297,9 @@ final class PlaybackService: NSObject {
                     let video = buffer.advance(to: entry.id,
                         ifEligible: { self.generation == request && self.queue.currentID == entry.id })
                     guard generation == request, queue.currentID == entry.id else { return }
-                    loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
+                    let naturalPosition = continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+                    let initialPosition = naturalPosition.isFinite && naturalPosition > 0.080 ? naturalPosition : 0
+                    loadCurrent(position: initialPosition, adopting: video, audioAlreadySelected: true)
                 } else if !ownedInitialVisit && !ownedPausedExplicitVisit {
                     #if DEBUG
                     synchronizeVideoToAudio(force: true, reason: .sourceVisit)
@@ -2303,8 +2314,14 @@ final class PlaybackService: NSObject {
         }
         clock.sample(position: Double(sample.frame) / 48_000)
         clock.updateDuration(Double(entry.frames) / 48_000)
-        continuousPiP.updatePlayback(positionSeconds: continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock())),
-            durationSeconds: clock.duration, isPlaying: intent.canPlay && !sample.ended)
+        let presentedAudioPosition = continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+        let activeVideoSync = videoClockSyncActive.flatMap { $0.request == generation ? $0 : nil }
+        let playingAudio = intent.canPlay && !sample.ended
+        continuousPiP.updatePlayback(positionSeconds: presentedAudioPosition,
+            durationSeconds: clock.duration, isPlaying: playingAudio,
+            displayRate: activeVideoSync?.rate ?? 1.0,
+            preserveDisplayClock: playingAudio && (activeVideoSync != nil
+                || (readyGeneration == generation && pendingInitialClockBinding == nil)))
         if pipSkipCompletion != nil, ProcessInfo.processInfo.systemUptime >= pipSkipDeadline { completePiPSkip() }
         if firstProgressGeneration != generation, sample.frame >= 2_400 {
             firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
@@ -2325,7 +2342,7 @@ final class PlaybackService: NSObject {
             synchronizeVideoToAudio()
             #endif
         }
-        recoverMissingVideoImages()
+        recoverMissingVideoImages(presentedAudioPosition: presentedAudioPosition)
         if Date().timeIntervalSince(lastNowPlayingUpdate) > 5 { updateNowPlaying() }
     }
 
@@ -2352,9 +2369,15 @@ final class PlaybackService: NSObject {
         let position = item.currentTime().seconds
         clock.sample(position: position)
         if usesNativeAudio, nativeSeekTicket == nil {
+            let effectiveRate = item.timebase.map { CMTimebaseGetEffectiveRate($0) } ?? 0
+            let actuallyPlaying = intent.canPlay && player.rate > 0
+                && effectiveRate.isFinite && effectiveRate > 0
+                && player.timeControlStatus == .playing
             continuousPiP.updatePlayback(positionSeconds: position, durationSeconds: clock.duration,
-                isPlaying: intent.canPlay && player.rate > 0)
-            recoverMissingVideoImages()
+                isPlaying: actuallyPlaying,
+                displayPositionSeconds: actuallyPlaying ? position : nil,
+                preserveDisplayClock: actuallyPlaying)
+            if actuallyPlaying { recoverMissingVideoImages() }
         }
         if firstProgressGeneration != generation, item.currentTime().seconds >= 0.05 {
             firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
@@ -2426,7 +2449,42 @@ final class PlaybackService: NSObject {
         if pcm {
             guard continuousAudio.isSelected, fresh.token == before.token, fresh.visit == before.visit,
                   fresh.selectionVersion == before.selectionVersion, !fresh.ended else { return }
-            if abs(nativePosition - position) > 1.0 / 30 {
+            let drift = position - nativePosition
+            let effectiveRate = item.timebase.map { CMTimebaseGetEffectiveRate($0) } ?? 0
+            if readyGeneration == request, pendingInitialClockBinding == nil,
+               abs(drift) <= VideoClockSync.maxRateSyncDriftSeconds {
+                guard effectiveRate.isFinite, effectiveRate > 0 else {
+                    // Do not force-seek on a transient effectiveRate == 0 hiccup while
+                    // drift stays inside rate-sync bounds; stoppedVideoClockNeedsRecovery
+                    // handles a genuinely dead clock after its grace period.
+                    return
+                }
+                let host = CMClockGetTime(CMClockGetHostTimeClock())
+                let desiredRate: Float
+                if abs(drift) > VideoClockSync.engageDriftSeconds || videoClockSyncActive?.request == request {
+                    desiredRate = VideoClockSync.targetRate(forDrift: drift)
+                } else {
+                    desiredRate = 1.0
+                }
+                let currentRate = player.rate
+                let repairSettling = ProcessInfo.processInfo.systemUptime - lastVideoOutputRepairTime < 0.18
+                let activeRate: Float
+                if !repairSettling, VideoClockSync.shouldApplyRate(desiredRate, current: currentRate) {
+                    player.playImmediately(atRate: desiredRate)
+                    activeRate = desiredRate
+                } else {
+                    activeRate = currentRate > 0 ? currentRate : 1.0
+                }
+                videoClockSyncActive = activeRate != 1.0 ? (request, activeRate) : nil
+                // Reanchor the display clock in place without flushing the layer or
+                // dropping readiness while the hardware video decoder runs smoothly.
+                continuousPiP.updatePlayback(positionSeconds: position, durationSeconds: clock.duration,
+                    isPlaying: true, atHostTime: host,
+                    displayPositionSeconds: nativePosition, displayRate: activeRate,
+                    preserveDisplayClock: true)
+                return
+            }
+            if abs(drift) > 1.0 / 30 {
                 #if DEBUG
                 synchronizeVideoToAudio(force: true, reason: .frameClockAlignment)
                 #else
@@ -2436,16 +2494,17 @@ final class PlaybackService: NSObject {
             }
         } else { guard usesNativeAudio, !continuousAudio.isSelected else { return } }
         // The native audio clock must never be sought for a layer-clock repair.
-        // Reanchor only the sample-buffer presentation clock, retaining its image.
-        guard continuousPiP.installTimeline(ticket, positionSeconds: position,
-            durationSeconds: clock.duration, isPlaying: true), generation == request,
-            intent.canPlay, videoAllowed, observedItem === item, videoPresentation?.ticket == ticket else { return }
-        _ = continuousPiP.activate(ticket)
+        // Reanchor only the sample-buffer presentation clock in place without flushing.
+        let host = CMClockGetTime(CMClockGetHostTimeClock())
+        continuousPiP.updatePlayback(positionSeconds: position, durationSeconds: clock.duration,
+            isPlaying: true, atHostTime: host,
+            displayPositionSeconds: position, displayRate: 1.0,
+            preserveDisplayClock: true)
     }
 
     /// The audible clock establishes progress even when the muted video clock fails.
     /// No audio selection, audio seek or queue mutation is authorized by this path.
-    private func recoverMissingVideoImages() {
+    private func recoverMissingVideoImages(presentedAudioPosition: Double? = nil) {
         guard intent.canPlay, videoAllowed, (continuousAudio.isSelected || usesNativeAudio), audioLoadingID == nil,
               statusHandledGeneration == generation, let item = observedItem,
               let presentation = videoPresentation, presentation.request == generation else {
@@ -2469,9 +2528,23 @@ final class PlaybackService: NSObject {
         guard syncingVideoGeneration != generation, nativeSeekTicket == nil,
               let timeline = continuousPiP.activeTimelineReceipt(for: presentation.ticket) else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        let itemPosition = pcm ? Double(sample.frame) / 48_000 : clock.position
-        let submittedIsLate = continuousPiP.lastFramePositionSeconds.map { itemPosition - $0 >= 0.080 }
-            ?? (itemPosition >= 0.080)
+        // Compare displayed video against speaker-aligned presentation time (or the
+        // actively converging display clock), never the future PCM render-ahead cursor.
+        let itemPosition: Double
+        if pcm {
+            let activeDisplay = videoClockSyncActive?.request == generation ? continuousPiP.timebasePositionSeconds : nil
+            let presented = presentedAudioPosition.flatMap { $0.isFinite ? $0 : nil }
+                ?? continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+            itemPosition = activeDisplay ?? (presented.isFinite ? presented : Double(sample.frame) / 48_000)
+        } else {
+            itemPosition = clock.position
+        }
+        // Scale the overdue check with the clip's source frame interval (>= 80 ms)
+        // so healthy 24/25 fps clips (40-41.7 ms/frame) do not trigger 33 Hz
+        // displayedPixelBuffer readbacks or per-frame sample cursor spawns.
+        let lateThreshold = max(0.080, continuousPiP.sourceFrameIntervalSeconds * 1.6)
+        let submittedIsLate = continuousPiP.lastFramePositionSeconds.map { itemPosition - $0 >= lateThreshold }
+            ?? (itemPosition >= lateThreshold)
         // Keep ordinary compositor reads infrequent. A stopped picture tap can
         // be recognized from its cached PTS without touching the display layer.
         guard now - lastImageProgressCheck >= (submittedIsLate ? 0.030 : 0.25) else { return }
@@ -2484,11 +2557,13 @@ final class PlaybackService: NSObject {
                   let entry = continuousAudio.entry(forToken: sample.token) else { return }
             // A natural repeat keeps the token and selection version. Its
             // position wraps, but the time without a current picture continues.
-            loopOffset = Double(sample.visit - imageProgressFirstVisit) * (Double(entry.frames) / 48_000)
-            position = loopOffset + Double(sample.frame) / 48_000
+            let duration = Double(entry.frames) / 48_000
+            let boundedItemPosition = duration > 0 ? min(max(0, itemPosition), duration) : max(0, itemPosition)
+            loopOffset = Double(sample.visit - imageProgressFirstVisit) * duration
+            position = loopOffset + boundedItemPosition
         } else {
             loopOffset = 0
-            guard let timebase = item.timebase else { return }
+            guard player.timeControlStatus == .playing, let timebase = item.timebase else { return }
             let rate = CMTimebaseGetEffectiveRate(timebase)
             guard rate.isFinite, rate > 0 else { return }
             position = CMTimebaseGetTime(timebase).seconds
@@ -2499,7 +2574,10 @@ final class PlaybackService: NSObject {
         var following: VideoImageProgress.NextSourceFrame?
         var authoredHold = false
         var unknownSlideDuration = false
-        if let itemImage, let displayed, position - displayed >= 0.080 {
+        // Only invoke fast sample-cursor tap-starvation recovery when the primary
+        // output actually stopped enqueuing fresh frames. Replacing a healthy tap
+        // on iOS 26 resets the video render pipeline and stalls AVPlayer.
+        if submittedIsLate, let itemImage, let displayed, position - displayed >= lateThreshold {
             if repeated { following = continuousPiP.followingFrame(after: itemImage, for: timeline) }
             unknownSlideDuration = following == nil && current?.kind == .slideshow
             switch following {
@@ -2509,7 +2587,7 @@ final class PlaybackService: NSObject {
             }
         }
         var detached = false
-        if submittedIsLate && (repeated || itemImage == nil) && !authoredHold,
+        if submittedIsLate && !authoredHold,
            lastOutputInspection?.timeline != timeline || now - (lastOutputInspection?.time ?? 0) >= 0.16 {
             lastOutputInspection = (timeline, now)
             detached = continuousPiP.isOutputDetached(for: timeline)
@@ -2558,7 +2636,9 @@ final class PlaybackService: NSObject {
                 }
                 let audioPosition = continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
                 guard ownsPicture() else { return }
-                let stoppedOrDrifting = runningPosition.map { !detached && following == nil && abs($0 - audioPosition) > 0.080 } ?? true
+                let stoppedOrDrifting = runningPosition.map {
+                    !detached && following == nil && abs($0 - audioPosition) > VideoClockSync.maxRateSyncDriftSeconds
+                } ?? true
                 if audioPosition.isFinite, (!detached && imageProgress.repairAttempts > 1) || stoppedOrDrifting {
                     synchronizeVideoToAudio(force: true, repairingPictureClock: true)
                     return
@@ -2567,11 +2647,12 @@ final class PlaybackService: NSObject {
             let repaired = following == nil && !detached
                 ? continuousPiP.rebuildFrameOutput(for: presentation.ticket)
                 : continuousPiP.replaceStarvedOutput(for: timeline, ifEligible: ownsVisit)
-            #if DEBUG
-            if repaired { onDebugVideoOutputRecovery?() }
-            #else
-            _ = repaired
-            #endif
+            if repaired {
+                lastVideoOutputRepairTime = ProcessInfo.processInfo.systemUptime
+                #if DEBUG
+                onDebugVideoOutputRecovery?()
+                #endif
+            }
         }
     }
 
@@ -2848,7 +2929,44 @@ final class PlaybackService: NSObject {
                 return
             }
         }
+        if !force, canPlay, !initialSelectionPending, readyGeneration == request,
+           pendingInitialClockBinding == nil, !sampledStoppedClock,
+           let native = sampledNativePosition, let goal = sampledAudioGoal,
+           native.isFinite, goal.isFinite, decisionSample != nil {
+            let syncRate = videoClockSyncActive?.request == request ? videoClockSyncActive!.rate : 1.0
+            if case .adjustRate(let desiredRate) = VideoClockSync.action(
+                videoPosition: native, audioPosition: goal,
+                currentRate: syncRate, isPlaying: true, isStopped: false, force: false) {
+                let drift = abs(goal - native)
+                if drift <= VideoClockSync.engageDriftSeconds && videoClockSyncActive == nil {
+                    return
+                }
+                let host = CMClockGetTime(CMClockGetHostTimeClock())
+                let currentRate = player.rate
+                let repairSettling = ProcessInfo.processInfo.systemUptime - lastVideoOutputRepairTime < 0.18
+                let activeRate: Float
+                if !repairSettling, VideoClockSync.shouldApplyRate(desiredRate, current: currentRate) {
+                    player.playImmediately(atRate: desiredRate)
+                    activeRate = desiredRate
+                } else {
+                    activeRate = currentRate > 0 ? currentRate : 1.0
+                }
+                if activeRate != 1.0 {
+                    videoClockSyncActive = (request, activeRate)
+                    continuousPiP.updatePlayback(positionSeconds: goal, durationSeconds: clock.duration,
+                        isPlaying: true, atHostTime: host, displayPositionSeconds: native, displayRate: activeRate,
+                        preserveDisplayClock: true)
+                } else if videoClockSyncActive != nil {
+                    videoClockSyncActive = nil
+                    continuousPiP.updatePlayback(positionSeconds: goal, durationSeconds: clock.duration,
+                        isPlaying: true, atHostTime: host, displayPositionSeconds: native, displayRate: 1.0,
+                        preserveDisplayClock: true)
+                }
+                return
+            }
+        }
         guard let correction else { return }
+        videoClockSyncActive = nil
         var bindingBeforeSeek = pendingInitialClockBinding
         if var binding = bindingBeforeSeek, binding.issued,
            ownsInitialClockBinding(binding, item: item) {
@@ -2885,6 +3003,7 @@ final class PlaybackService: NSObject {
             guard ownsRepair(), player.currentItem === item, ownsRepair() else { abandonRepair(); return }
             restartingPictureClock = continuousPiP.rebuildFrameOutput(for: presentation.ticket,
                 duringSeek: videoSeek, ifEligible: ownsRepair)
+            if restartingPictureClock { lastVideoOutputRepairTime = ProcessInfo.processInfo.systemUptime }
             // SDK output replacement can take time while PCM keeps advancing.
             guard ownsRepair(), player.currentItem === item, ownsRepair() else { abandonRepair(); return }
             let fresh = continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
@@ -3009,9 +3128,37 @@ final class PlaybackService: NSObject {
                         && self.ownsVideoCorrectionCompletion(for: item, request: request, selectedID: selectedID)
                         && self.videoPresentation?.request == request && self.videoPresentation?.ticket == ticket
                 }
+                let postSeek: VideoClockSync.PostSeekStart
+                if self.intent.canPlay {
+                    postSeek = initialBindingAtIssue == nil
+                        ? VideoClockSync.postSeekStart(soughtPosition: position, audioPosition: desired)
+                        : .resyncToAudio(desired)
+                } else {
+                    postSeek = .playImmediately(rate: 1.0)
+                }
+                let timelineDisplayPosition: Double?
+                let timelineDisplayRate: Float
+                if self.intent.canPlay {
+                    switch postSeek {
+                    case .playImmediately(let rate):
+                        timelineDisplayPosition = position
+                        timelineDisplayRate = rate
+                    case .scheduleAtFutureHost:
+                        timelineDisplayPosition = desired
+                        timelineDisplayRate = 1.0
+                    case .resyncToAudio(let audioTarget):
+                        timelineDisplayPosition = audioTarget
+                        timelineDisplayRate = 1.0
+                    }
+                } else {
+                    timelineDisplayPosition = nil
+                    timelineDisplayRate = 1.0
+                }
                 guard ownsPresentation(),
                       self.continuousPiP.installTimeline(ticket, positionSeconds: desired,
-                          durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay, atHostTime: host) else { return }
+                          durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay,
+                          atHostTime: host, displayPositionSeconds: timelineDisplayPosition,
+                          displayRate: timelineDisplayRate) else { return }
                 guard ownsPresentation() else { return }
                 self.continuousPiP.completeSeek(videoSeek)
                 if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
@@ -3021,15 +3168,47 @@ final class PlaybackService: NSObject {
                 if self.intent.canPlay, restartingPictureClock, abs(position - desired) <= 1.0 / 30 {
                     // The recovery seek just loaded this position. Resume it
                     // without a second native seek for a fractional-frame delta.
+                    self.videoClockSyncActive = nil
                     self.player.playImmediately(atRate: 1)
                 } else if self.intent.canPlay {
-                    #if DEBUG
-                    self.debugSetVideoRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000),
-                        atHostTime: host, item: item, request: request, cause: .correctionCompletion)
-                    #else
-                    self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000),
-                                        atHostTime: host)
-                    #endif
+                    switch postSeek {
+                    case .playImmediately(let rate):
+                        // The seek just decoded `position`. When the decoder is paused,
+                        // anchor directly to `installTimeline`'s host timestamp without a
+                        // second exact seek; when already running, adjust rate in place
+                        // with `playImmediately(atRate:)` to avoid a synchronizer stall.
+                        self.videoClockSyncActive = rate != 1.0 ? (request, rate) : nil
+                        if self.player.rate == 0 {
+                            #if DEBUG
+                            self.debugSetVideoRate(rate, time: .invalid, atHostTime: host,
+                                item: item, request: request, cause: .correctionCompletion)
+                            #else
+                            self.player.setRate(rate, time: .invalid, atHostTime: host)
+                            #endif
+                        } else {
+                            self.player.playImmediately(atRate: rate)
+                        }
+                    case .scheduleAtFutureHost(let delay):
+                        // Video landed slightly ahead of audio; hold on the decoded
+                        // frame until audio catches up without seeking again.
+                        let startHost = CMTimeAdd(host, CMTime(seconds: delay, preferredTimescale: 48_000))
+                        self.videoClockSyncActive = nil
+                        #if DEBUG
+                        self.debugSetVideoRate(1, time: .invalid, atHostTime: startHost,
+                            item: item, request: request, cause: .correctionCompletion)
+                        #else
+                        self.player.setRate(1, time: .invalid, atHostTime: startHost)
+                        #endif
+                    case .resyncToAudio(let audioTarget):
+                        let anchorTime = CMTime(seconds: audioTarget, preferredTimescale: 48_000)
+                        self.videoClockSyncActive = nil
+                        #if DEBUG
+                        self.debugSetVideoRate(1, time: anchorTime, atHostTime: host,
+                            item: item, request: request, cause: .correctionCompletion)
+                        #else
+                        self.player.setRate(1, time: anchorTime, atHostTime: host)
+                        #endif
+                    }
                 }
                 if initialBindingAtIssue == nil, ownsPresentation(), self.pendingInitialClockBinding == nil {
                     let activated = self.continuousPiP.activate(ticket)
@@ -3196,13 +3375,16 @@ final class PlaybackService: NSObject {
         // This is a cached freshness check, not a sync decision. Allow for a
         // few frames and the PCM render-ahead; precise drift and missing
         // displayed images are still checked by the normal playback tick.
-        return abs(Double(sample.frame) / 48_000 - position) <= 0.12
+        let audioPosition = continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+        let reference = audioPosition.isFinite ? audioPosition : Double(sample.frame) / 48_000
+        return abs(reference - position) <= 0.12
     }
 
     func handleInterruption(began: Bool, shouldResume: Bool = false) {
         let command = beginAudioCommand()
         recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
+            videoClockSyncActive = nil
             imageProgressOwner = nil; imageProgress = VideoImageProgress(); lastImageProgressCheck = 0
             transferInitialClockBinding(retainActivation: true)
             intent.interruptionBegan(); initialPollWindow.withdraw(request: generation); cancelStallRecovery()
@@ -3246,6 +3428,7 @@ final class PlaybackService: NSObject {
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
         let restoringSuspendedVideo = videoAllowed && continuousPiP.isFrameFeedSuspended
         if !videoAllowed {
+            videoClockSyncActive = nil
             initialPollWindow.withdraw(request: generation)
             transferInitialClockBinding(retainActivation: true)
             if usesNativeAudio { surface.playerLayer.player = nil }
@@ -3416,6 +3599,18 @@ final class PlaybackService: NSObject {
                 self.enforceNativePlaybackPermission()
                 if self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
                 else if self.player.timeControlStatus == .playing { self.cancelStallRecovery() }
+                if self.usesNativeAudio, self.nativeSeekTicket == nil,
+                   self.readyGeneration == self.generation,
+                   let item = self.observedItem, self.player.currentItem === item {
+                    let position = item.currentTime().seconds
+                    if position.isFinite {
+                        let playing = self.intent.canPlay && self.player.timeControlStatus == .playing
+                        self.continuousPiP.updatePlayback(positionSeconds: position, durationSeconds: self.clock.duration,
+                            isPlaying: playing,
+                            displayPositionSeconds: playing ? position : nil,
+                            preserveDisplayClock: playing)
+                    }
+                }
                 self.recordPlaybackEvent(self.player.timeControlStatus == .playing ? "playing" : "waitingOrPaused")
             }
         }

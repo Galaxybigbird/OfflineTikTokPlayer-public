@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import PlayerCore
 
 /// A bounded hard-recovery decoder. Its item never owns audible playback.
 /// The original audible item's outputs remain installed while this one runs.
@@ -38,6 +39,7 @@ final class IsolatedVideoRecovery {
         else { asset = source.asset }
         let item = AVPlayerItem(asset: asset)
         item.videoComposition = source.videoComposition
+        item.audioTimePitchAlgorithm = .varispeed
         item.preferredForwardBufferDuration = 2
         let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
         try Task.checkCancellation()
@@ -82,6 +84,7 @@ final class IsolatedVideoRecovery {
         if !force, playing {
             let now = ProcessInfo.processInfo.systemUptime
             let rate = item.timebase.map { CMTimebaseGetEffectiveRate($0) } ?? 0
+            var startupRetry = false
             if let start = scheduledStart {
                 if rate > 0, native.isNumeric, native.seconds > start.position + 1.0 / 48_000 {
                     scheduledStart = nil
@@ -89,10 +92,20 @@ final class IsolatedVideoRecovery {
                     // setRate returning is not proof of a running native clock.
                     // Permit only one delayed retry per explicit presentation context.
                     guard now - start.host >= 1.5, !usedStartupRecovery else { return }
-                    usedStartupRecovery = true; scheduledStart = nil
+                    usedStartupRecovery = true; scheduledStart = nil; startupRetry = true
                 }
             } else if rate <= 0 {
                 scheduledStart = (now, native.isNumeric ? native.seconds : target.seconds)
+                return
+            }
+            if !startupRetry, rate > 0, native.isNumeric,
+               case .adjustRate(let desiredRate) = VideoClockSync.action(
+                   videoPosition: native.seconds, audioPosition: target.seconds,
+                   currentRate: player.rate > 0 ? player.rate : 1.0,
+                   isPlaying: true, isStopped: false, force: false) {
+                if player.rate == 0 || VideoClockSync.shouldApplyRate(desiredRate, current: player.rate) {
+                    player.playImmediately(atRate: desiredRate)
+                }
                 return
             }
         }
@@ -128,12 +141,24 @@ final class IsolatedVideoRecovery {
             }
             if playing {
                 let host = CMClockGetTime(CMClockGetHostTimeClock())
-                self.scheduledStart = (ProcessInfo.processInfo.systemUptime, fresh.seconds)
+                let postSeek = VideoClockSync.postSeekStart(soughtPosition: target.seconds,
+                                                            audioPosition: fresh.seconds)
+                let startPosition: Double
+                switch postSeek {
+                case .playImmediately, .scheduleAtFutureHost: startPosition = target.seconds
+                case .resyncToAudio(let audioTarget): startPosition = audioTarget
+                }
                 #if DEBUG
-                if let schedule = self.debugScheduleStart { schedule(self.player, fresh, host) }
-                else { self.player.setRate(1, time: fresh, atHostTime: host) }
+                if let schedule = self.debugScheduleStart {
+                    self.scheduledStart = (ProcessInfo.processInfo.systemUptime, fresh.seconds)
+                    schedule(self.player, fresh, host)
+                } else {
+                    self.scheduledStart = (ProcessInfo.processInfo.systemUptime, startPosition)
+                    self.applyPostSeekStart(postSeek, atHostTime: host)
+                }
                 #else
-                self.player.setRate(1, time: fresh, atHostTime: host)
+                self.scheduledStart = (ProcessInfo.processInfo.systemUptime, startPosition)
+                self.applyPostSeekStart(postSeek, atHostTime: host)
                 #endif
             } else { self.player.pause() }
             guard !Task.isCancelled, !self.closed, self.revision == request else { return }
@@ -160,6 +185,18 @@ final class IsolatedVideoRecovery {
         player.replaceCurrentItem(with: nil)
         resource.retire()
         return pendingWork()
+    }
+
+    private func applyPostSeekStart(_ start: VideoClockSync.PostSeekStart, atHostTime host: CMTime) {
+        switch start {
+        case .playImmediately(let rate):
+            player.setRate(rate, time: .invalid, atHostTime: host)
+        case .scheduleAtFutureHost(let delay):
+            let startHost = CMTimeAdd(host, CMTime(seconds: delay, preferredTimescale: 48_000))
+            player.setRate(1, time: .invalid, atHostTime: startHost)
+        case .resyncToAudio(let audioTarget):
+            player.setRate(1, time: CMTime(seconds: audioTarget, preferredTimescale: 48_000), atHostTime: host)
+        }
     }
 
     private func cancelAlignment() {

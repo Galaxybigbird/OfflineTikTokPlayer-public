@@ -18,7 +18,6 @@ final class ContinuousPictureInPictureResourceTests: XCTestCase {
         defer { buffer.replace(with: nil); buffer.discardPrevious() }
         let tracks = try await item.asset.loadTracks(withMediaType: .video)
         let track = try XCTUnwrap(tracks.first)
-        let duration = try await item.asset.load(.duration)
         XCTAssertTrue(item.outputs.isEmpty)
         XCTAssertNil(item.videoComposition)
 
@@ -44,18 +43,31 @@ final class ContinuousPictureInPictureResourceTests: XCTestCase {
         XCTAssertEqual(item.outputs.count, 1)
         XCTAssertTrue(item.outputs.first === output)
         XCTAssertFalse(output.suppressesPlayerRendering)
-        // The setter copies its argument. Inspect the actual installed getter,
-        // rather than comparing it to the mutable composition used to build it.
-        let installed = try XCTUnwrap(item.videoComposition)
+        // Upright clips with ordinary <=80 ms AAC tails stay on the zero-copy native path.
+        XCTAssertNil(item.videoComposition)
+        #if DEBUG
+        XCTAssertTrue(resource.debugUsesNativeGeometry)
+        #endif
+
+        // An asset that requires composition (e.g. AVComposition) still installs a bounded composition.
+        let composed = AVMutableComposition()
+        let composedTrack = try XCTUnwrap(composed.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid))
+        let range = try await track.load(.timeRange)
+        try composedTrack.insertTimeRange(range, of: track, at: .zero)
+        let composedItem = AVPlayerItem(asset: composed)
+        let composedPlan = try await ContinuousPictureInPicture.prepareVideoResource(for: composedItem)
+        let composedResource = try XCTUnwrap(composedPlan.install())
+        defer { composedResource.retire() }
+        let installed = try XCTUnwrap(composedItem.videoComposition)
         XCTAssertEqual(installed.renderSize, CGSize(width: 256, height: 454))
-        XCTAssertEqual(installed.sourceTrackIDForFrameTiming, track.trackID)
-        XCTAssertEqual(CMTimeCompare(try XCTUnwrap(installed.instructions.first).timeRange.duration, duration), 0)
+        XCTAssertEqual(installed.sourceTrackIDForFrameTiming, composedTrack.trackID)
+        XCTAssertEqual(CMTimeCompare(try XCTUnwrap(installed.instructions.first).timeRange.duration, range.duration), 0)
 
         XCTAssertTrue(buffer.hasPrepared("a"))
         XCTAssertTrue(buffer.resource(for: item) === resource)
         XCTAssertTrue(item.outputs.first === output)
         XCTAssertEqual(item.outputs.count, 1)
-        XCTAssertTrue(item.videoComposition === installed)
+        XCTAssertNil(item.videoComposition)
     }
 
     func testPreparedResourcesSurviveABAReturnWithoutOutputPullBeforeActivation() async throws {
@@ -236,7 +248,14 @@ final class ContinuousPictureInPictureResourceTests: XCTestCase {
     }
 
     func testRetirementPreservesExternallyReplacedComposition() async throws {
-        let item = try makeItem()
+        let source = try makeItem()
+        let composed = AVMutableComposition()
+        let sourceTracks = try await source.asset.loadTracks(withMediaType: .video)
+        let sourceTrack = try XCTUnwrap(sourceTracks.first)
+        let range = try await sourceTrack.load(.timeRange)
+        let targetTrack = try XCTUnwrap(composed.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid))
+        try targetTrack.insertTimeRange(range, of: sourceTrack, at: .zero)
+        let item = AVPlayerItem(asset: composed)
         let resource = try await installResource(for: item)
         defer { resource.retire() }
         let output = try XCTUnwrap(resource.output)

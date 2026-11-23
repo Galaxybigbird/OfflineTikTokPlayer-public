@@ -13,6 +13,18 @@ final class NativeVideoCoverageTests: XCTestCase {
                 assetDuration: asset, frameDuration: frame), "Preserve the full audio tail and native video range")
         }
     }
+    func testRealAACMasteredTailsOn30And60FPSClipsKeepNativePresentation() {
+        let timelines: [(Double, Double, Double)] = [
+            (125.8667, 125.921, 1.0 / 30),
+            (21.5333, 21.593, 1.0 / 30),
+            (126.7833, 126.829, 1.0 / 60),
+            (188.0667, 188.140, 1.0 / 60)
+        ]
+        for (end, asset, frame) in timelines {
+            XCTAssertTrue(NativeVideoCoverage.allowsNativePresentation(start: 0, end: end,
+                assetDuration: asset, frameDuration: frame), "Standard <=80 ms AAC tails must stay on the zero-copy native path")
+        }
+    }
     func testExactCoverageStillWorksWithoutCadenceMetadata() {
         XCTAssertTrue(NativeVideoCoverage.allowsNativePresentation(start: 0, end: 6,
             assetDuration: 6, frameDuration: .nan))

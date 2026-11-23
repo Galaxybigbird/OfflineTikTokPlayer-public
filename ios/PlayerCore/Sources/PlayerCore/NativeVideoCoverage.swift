@@ -9,9 +9,10 @@ public enum NativeVideoCoverage {
         let tail = assetDuration - end
         if tail == 0 { return true }
         guard frameDuration.isFinite, frameDuration > 0 else { return false }
-        // AAC/container rounding can leave less than one video frame of audio.
+        // AAC/container rounding and mastered-audio priming can leave up to a few
+        // audio frames (<= 80 ms) past the last video frame even on 30/60 fps clips.
         // Preserve both tracks; never stretch/trim video or admit a long empty tail.
         let rounding = max(1, max(abs(end), abs(assetDuration))) * Double.ulpOfOne * 8
-        return tail <= min(frameDuration, 0.080) + rounding
+        return tail <= 0.080 + rounding
     }
 }

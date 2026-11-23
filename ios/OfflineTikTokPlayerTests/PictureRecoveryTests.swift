@@ -783,7 +783,8 @@ final class PictureRecoveryTests: XCTestCase {
             try await until { service.audioSnapshot.frame > audible + 3_840 }
             let still = try XCTUnwrap(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())))
             try await until { service.audioSnapshot.frame > audible + 24_000 }
-            XCTAssertGreaterThan(item.currentTime().seconds, native + 0.25)
+            XCTAssertGreaterThan(item.currentTime().seconds, native + 0.25,
+                "attempt=\(attempt) native=\(native) current=\(item.currentTime().seconds) held=\(held) rate=\(service.player.rate) requested=\(service.videoRequestedPositionSeconds)")
             XCTAssertEqual(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())), still)
             try await until { item.outputs.first !== output }
             service.shouldDebugAcquireVideoFrame = nil
@@ -1019,6 +1020,331 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertEqual(decoder.debugSeekCount, seeks)
     }
 
+    func testSlowHardwareSeekResumesSmoothlyWithoutSeekLoop() async throws {
+        let delayedSeekCompleted = Atomic<Bool>(false)
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-1080", firstDuration: 6,
+            seekVideo: { player, time, completion in
+                // Pause and delay before landing on `time` to reproduce real iPhone H.264/HEVC
+                // GOP seek latency (~220 ms) while continuous PCM audio keeps advancing.
+                player.pause()
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(220))
+                    player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                        delayedSeekCompleted.store(true, ordering: .releasing)
+                        completion(finished)
+                    }
+                }
+            })
+        let service = fixture.service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && service.audioSnapshot.frame > 18_000 }
+
+        var totalSeeks = 0, driftSeeks = 0, repairs = 0
+        var maxObservedRate: Float = 1.0
+        service.onDebugVideoSeekStamp = { stamp in
+            totalSeeks += 1
+            if stamp.reason == .drift || stamp.reason == .frameClockAlignment { driftSeeks += 1 }
+        }
+        service.onDebugVideoOutputRecovery = { repairs += 1 }
+
+        let baselineUnderruns = service.audioSnapshot.underrunFrames
+        service.seek(0.15)
+        try await until {
+            delayedSeekCompleted.load(ordering: .acquiring)
+                && service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+        }
+
+        let startFrames = service.submittedVideoFrameCount
+        let startAudioFrame = service.audioSnapshot.frame
+        let startAudioPos = service.videoRequestedPositionSeconds
+        let startVideoPos = service.player.currentItem?.timebase.map { CMTimebaseGetTime($0).seconds } ?? -1
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let minEnd = startedAt + 2.0
+        let deadline = startedAt + 4.6
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            maxObservedRate = max(maxObservedRate, service.player.rate)
+            let now = ProcessInfo.processInfo.systemUptime
+            if now >= minEnd,
+               let tb = service.player.currentItem?.timebase,
+               abs(service.videoRequestedPositionSeconds - CMTimebaseGetTime(tb).seconds) <= 0.040,
+               abs(service.player.rate - 1.0) <= 0.02 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let elapsed = max(0.1, ProcessInfo.processInfo.systemUptime - startedAt)
+
+        let deliveredFrames = service.submittedVideoFrameCount - startFrames
+        let deliveredFPS = Double(deliveredFrames) / elapsed
+        // Verify playback keeps running smoothly at 1.0x after snapping back from catch-up rate.
+        let postFramesStart = service.submittedVideoFrameCount
+        try await Task.sleep(for: .milliseconds(500))
+        let postSettleFrames = service.submittedVideoFrameCount - postFramesStart
+        let finalAudio = service.videoRequestedPositionSeconds
+        let finalVideo = service.player.currentItem?.timebase.map { CMTimebaseGetTime($0).seconds } ?? -1
+        let finalEffRate = service.player.currentItem?.timebase.map { CMTimebaseGetEffectiveRate($0) } ?? -1
+        let finalDrift = abs(finalAudio - finalVideo)
+        let diag = "totalSeeks=\(totalSeeks) driftSeeks=\(driftSeeks) repairs=\(repairs) startAudio=\(startAudioPos) startVideo=\(startVideoPos) maxRate=\(maxObservedRate) endRate=\(service.player.rate) effRate=\(finalEffRate) delivered=\(deliveredFrames) fps=\(deliveredFPS) postFrames=\(postSettleFrames) elapsed=\(elapsed) finalAudio=\(finalAudio) finalVideo=\(finalVideo) finalDrift=\(finalDrift)"
+        print("SMOOTH_SEEK_TEST " + diag)
+
+        XCTAssertEqual(totalSeeks, 1, "Slow seek completion must resume smoothly without triggering a secondary seek loop (\(diag))")
+        XCTAssertEqual(driftSeeks, 0, "Catch-up after a slow seek must use muted playback rate, never drift seeks (\(diag))")
+        XCTAssertEqual(repairs, 0, "Smooth rate convergence must not trigger video output teardown/rebuild (\(diag))")
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, baselineUnderruns, "Audio must remain uninterrupted (\(diag))")
+        XCTAssertGreaterThan(service.audioSnapshot.frame, startAudioFrame + 80_000, "Audio must advance smoothly during video catch-up (\(diag))")
+        XCTAssertGreaterThan(maxObservedRate, 1.01, "Muted video must gently speed up to absorb seek latency (\(diag))")
+        XCTAssertGreaterThanOrEqual(deliveredFPS, 45, "Video must maintain smooth framerate instead of stalling like a slideshow (\(diag))")
+        XCTAssertGreaterThanOrEqual(postSettleFrames, 20, "Video must keep delivering frames smoothly after settling back to 1.0x (\(diag))")
+        XCTAssertGreaterThan(finalEffRate, 0.95, "Item timebase must remain actively running at 1.0x after convergence (\(diag))")
+        XCTAssertLessThanOrEqual(finalDrift, 0.055, "Video must converge back into tight A/V sync (\(diag))")
+        XCTAssertEqual(service.player.rate, 1.0, accuracy: 0.04, "Muted video rate must settle back toward 1.0x after converging (\(diag))")
+    }
+
+    func testModerateDriftRateMatchesSmoothlyWithoutSeeking() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-60", firstDuration: 6)
+        let service = fixture.service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && service.audioSnapshot.frame > 24_000 }
+
+        let baselineUnderruns = service.audioSnapshot.underrunFrames
+        let audioNow = service.videoRequestedPositionSeconds
+        // Inject 220 ms video lag (as happens after a brief hardware decode hiccup).
+        service.player.setRate(1, time: CMTime(seconds: max(0.05, audioNow - 0.22), preferredTimescale: 48_000),
+                               atHostTime: CMClockGetTime(CMClockGetHostTimeClock()))
+        try await until {
+            guard let tb = service.player.currentItem?.timebase, CMTimebaseGetEffectiveRate(tb) > 0 else { return false }
+            let drift = service.videoRequestedPositionSeconds - CMTimebaseGetTime(tb).seconds
+            return drift > 0.12 && drift < 0.70
+        }
+        var totalSeeks = 0, repairs = 0
+        var maxObservedRate: Float = service.player.rate
+        service.onDebugVideoSeekStamp = { _ in totalSeeks += 1 }
+        service.onDebugVideoOutputRecovery = { repairs += 1 }
+
+        let startFrames = service.submittedVideoFrameCount
+        let startEpoch = service.debugAlignedVideoPollState.frame.imageEpoch
+        let startAudioPos = service.videoRequestedPositionSeconds
+        let startVideoPos = service.player.currentItem?.timebase.map { CMTimebaseGetTime($0).seconds } ?? -1
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let minEnd = startedAt + 1.5
+        let deadline = startedAt + 4.4
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            maxObservedRate = max(maxObservedRate, service.player.rate)
+            let now = ProcessInfo.processInfo.systemUptime
+            if now >= minEnd,
+               let tb = service.player.currentItem?.timebase,
+               abs(service.videoRequestedPositionSeconds - CMTimebaseGetTime(tb).seconds) <= 0.040,
+               abs(service.player.rate - 1.0) <= 0.02 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let elapsed = max(0.1, ProcessInfo.processInfo.systemUptime - startedAt)
+
+        let deliveredFrames = service.submittedVideoFrameCount - startFrames
+        let deliveredFPS = Double(deliveredFrames) / elapsed
+        let epochAfterSync = service.debugAlignedVideoPollState.frame.imageEpoch
+        let postFramesStart = service.submittedVideoFrameCount
+        try await Task.sleep(for: .milliseconds(500))
+        let postSettleFrames = service.submittedVideoFrameCount - postFramesStart
+        let finalAudio = service.videoRequestedPositionSeconds
+        let finalVideo = service.player.currentItem?.timebase.map { CMTimebaseGetTime($0).seconds } ?? -1
+        let finalEffRate = service.player.currentItem?.timebase.map { CMTimebaseGetEffectiveRate($0) } ?? -1
+        let finalDrift = abs(finalAudio - finalVideo)
+        let diag = "totalSeeks=\(totalSeeks) repairs=\(repairs) epochDelta=\(epochAfterSync &- startEpoch) startAudio=\(startAudioPos) startVideo=\(startVideoPos) maxRate=\(maxObservedRate) endRate=\(service.player.rate) effRate=\(finalEffRate) delivered=\(deliveredFrames) fps=\(deliveredFPS) postFrames=\(postSettleFrames) elapsed=\(elapsed) finalAudio=\(finalAudio) finalVideo=\(finalVideo) finalDrift=\(finalDrift)"
+        print("MODERATE_DRIFT_TEST " + diag)
+
+        XCTAssertEqual(totalSeeks, 0, "Moderate drift must converge via muted playback rate with zero seeks (\(diag))")
+        XCTAssertEqual(repairs, 0, "Moderate drift convergence must not tear down the video output (\(diag))")
+        XCTAssertLessThanOrEqual(epochAfterSync &- startEpoch, 1, "Smooth rate convergence and 1.0x release must not repeatedly flush the display layer (\(diag))")
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, baselineUnderruns, "Audio must remain uninterrupted (\(diag))")
+        XCTAssertGreaterThan(maxObservedRate, 1.02, "Muted video must smoothly speed up to close lag (\(diag))")
+        XCTAssertGreaterThanOrEqual(deliveredFPS, 45, "Video frames must continue advancing smoothly during rate catch-up (\(diag))")
+        XCTAssertGreaterThanOrEqual(postSettleFrames, 20, "Video must keep delivering frames smoothly after settling back to 1.0x (\(diag))")
+        XCTAssertGreaterThan(finalEffRate, 0.95, "Item timebase must remain actively running at 1.0x after convergence (\(diag))")
+        XCTAssertLessThanOrEqual(finalDrift, 0.055, "Video must converge back into tight A/V sync (\(diag))")
+        XCTAssertEqual(service.player.rate, 1.0, accuracy: 0.04, "Muted video rate must settle back toward 1.0x (\(diag))")
+    }
+
+    func testRealTikTokProfile24FPSWithAudioTailStaysNativeAndSmoothWithoutAlternatePolling() async throws {
+        // Synthesize a 24 fps H.264 clip with non-integer duration (3.0417 s -> mvhd 1 ms rounding)
+        // and a 55 ms AAC audio tail (> 1 video frame), matching real mastered TikTok MP4s.
+        let clipURL = try await makeRealTikTokProfile24FPSClip()
+        defer { try? FileManager.default.removeItem(at: clipURL) }
+
+        // Prove the zero-copy native VideoToolbox path qualifies without AVMutableVideoComposition.
+        let probeItem = AVPlayerItem(url: clipURL)
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: probeItem)
+        let resource = try XCTUnwrap(plan.install())
+        defer { resource.retire() }
+        XCTAssertTrue(resource.debugUsesNativeGeometry, "24 fps clip with 55 ms AAC tail and mvhd rounding must stay on the native zero-copy path")
+        XCTAssertNil(probeItem.videoComposition, "Native-qualified clip must not install AVMutableVideoComposition")
+        resource.retire()
+
+        let fixture = try await PictureRecoveryFixture(test: self, firstDuration: 3.1, customFirstURL: clipURL)
+        let service = fixture.service
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && service.audioSnapshot.frame > 14_400 }
+
+        var totalSeeks = 0, repairs = 0
+        service.onDebugVideoSeekStamp = { _ in totalSeeks += 1 }
+        service.onDebugVideoOutputRecovery = { repairs += 1 }
+        let startEpoch = service.debugAlignedVideoPollState.frame.imageEpoch
+        let startFrames = service.submittedVideoFrameCount
+        let startAlt = service.debugAlternateFrameCount
+        let beforeAudio = service.audioSnapshot
+        let firstPicture = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer().flatMap(sampledHDPicture))
+
+        try await Task.sleep(for: .milliseconds(1200))
+
+        let endEpoch = service.debugAlignedVideoPollState.frame.imageEpoch
+        let delivered = service.submittedVideoFrameCount - startFrames
+        let alternateUsed = service.debugAlternateFrameCount - startAlt
+        let afterAudio = service.audioSnapshot
+        let secondPicture = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer().flatMap(sampledHDPicture))
+        let item = try XCTUnwrap(service.player.currentItem)
+        let diag = "delivered=\(delivered) alternate=\(alternateUsed) epochDelta=\(endEpoch &- startEpoch) seeks=\(totalSeeks) repairs=\(repairs) hasComposition=\(item.videoComposition != nil) underruns=\(afterAudio.underrunFrames - beforeAudio.underrunFrames)"
+        print("REAL_TIKTOK_24FPS " + diag)
+
+        XCTAssertNil(item.videoComposition, "Live playback of 24 fps clip with 55 ms audio tail must keep zero-copy native path (\(diag))")
+        XCTAssertEqual(endEpoch, startEpoch, "Healthy 24 fps playback must not flush the display layer (\(diag))")
+        XCTAssertEqual(totalSeeks, 0, "Healthy 24 fps playback must not issue drift seeks (\(diag))")
+        XCTAssertEqual(repairs, 0, "Healthy 24 fps playback must not trigger output rebuilds (\(diag))")
+        XCTAssertLessThanOrEqual(alternateUsed, 2, "Healthy 24 fps playback must not hammer-poll AVPlayerVideoOutput between frames (\(diag))")
+        XCTAssertGreaterThanOrEqual(delivered, 22, "24 fps playback over 1.2 s must deliver smooth uninterrupted frames without lead-guard drops (\(diag))")
+        XCTAssertNotEqual(firstPicture, secondPicture, "Displayed picture must visibly move (\(diag))")
+        XCTAssertEqual(afterAudio.underrunFrames, beforeAudio.underrunFrames, "Audio must have zero underruns (\(diag))")
+    }
+
+    private func makeRealTikTokProfile24FPSClip() async throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("real-tiktok-24fps-" + UUID().uuidString + ".mp4")
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let width = 320, height = 576
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width, AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 1_200_000,
+                AVVideoMaxKeyFrameIntervalKey: 72
+            ]
+        ])
+        videoInput.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: videoInput, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height
+        ])
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44_100,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: 128_000
+        ])
+        audioInput.expectsMediaDataInRealTime = false
+        writer.add(videoInput)
+        writer.add(audioInput)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+
+        // Interleave video (74 frames @ 24 fps -> last PTS 73/24 = 3.041667 s, non-integer ms)
+        // and audio (~3.088 s + AAC frame rounding -> <= 80 ms tail) so AVAssetWriter never stalls.
+        let totalVideoFrames = 74
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: 44_100, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+            mChannelsPerFrame: 2, mBitsPerChannel: 16, mReserved: 0)
+        var formatDesc: CMAudioFormatDescription?
+        XCTAssertEqual(CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil,
+            formatDescriptionOut: &formatDesc), noErr)
+        let audioFormat = try XCTUnwrap(formatDesc)
+        let totalAudioSamples = 135_168
+        var videoIndex = 0
+        var audioOffset = 0
+        var videoFinished = false
+        var audioFinished = false
+        let deadline = ProcessInfo.processInfo.systemUptime + 20
+        while (!videoFinished || !audioFinished) && ProcessInfo.processInfo.systemUptime < deadline {
+            let videoTime = videoIndex < totalVideoFrames ? Double(videoIndex) / 24.0 : Double.infinity
+            let audioTime = audioOffset < totalAudioSamples ? Double(audioOffset) / 44_100.0 : Double.infinity
+            var progressed = false
+            let videoReady = !videoFinished && videoInput.isReadyForMoreMediaData
+            let audioReady = !audioFinished && audioInput.isReadyForMoreMediaData
+            if videoReady && (videoTime <= audioTime || !audioReady) {
+                let pool = try XCTUnwrap(adaptor.pixelBufferPool)
+                var buffer: CVPixelBuffer?
+                XCTAssertEqual(CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer), kCVReturnSuccess)
+                let pixel = try XCTUnwrap(buffer)
+                CVPixelBufferLockBaseAddress(pixel, [])
+                if let base = CVPixelBufferGetBaseAddress(pixel)?.assumingMemoryBound(to: UInt8.self) {
+                    let rowBytes = CVPixelBufferGetBytesPerRow(pixel)
+                    memset(base, 24, rowBytes * height)
+                    let barY = (videoIndex * 7) % (height - 48)
+                    for y in barY..<(barY + 48) {
+                        let row = base.advanced(by: y * rowBytes)
+                        for x in 0..<width {
+                            row[x * 4] = 240
+                            row[x * 4 + 1] = UInt8((videoIndex * 3) & 0xFF)
+                            row[x * 4 + 2] = 40
+                            row[x * 4 + 3] = 255
+                        }
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(pixel, [])
+                let pts = CMTime(value: Int64(videoIndex), timescale: 24)
+                XCTAssertTrue(adaptor.append(pixel, withPresentationTime: pts))
+                videoIndex += 1
+                if videoIndex >= totalVideoFrames {
+                    videoInput.markAsFinished()
+                    videoFinished = true
+                }
+                progressed = true
+            }
+            if !audioFinished && audioInput.isReadyForMoreMediaData
+                && (audioTime <= videoTime || videoFinished || !videoInput.isReadyForMoreMediaData) {
+                let count = min(2048, totalAudioSamples - audioOffset)
+                var samples = [Int16](repeating: 0, count: count * 2)
+                for i in 0..<count {
+                    let t = Double(audioOffset + i) / 44_100.0
+                    let v = Int16(sin(2.0 * .pi * 440.0 * t) * 8000.0)
+                    samples[i * 2] = v; samples[i * 2 + 1] = v
+                }
+                var block: CMBlockBuffer?
+                let byteCount = samples.count * MemoryLayout<Int16>.size
+                XCTAssertEqual(CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+                    memoryBlock: nil, blockLength: byteCount, blockAllocator: kCFAllocatorDefault,
+                    customBlockSource: nil, offsetToData: 0, dataLength: byteCount, flags: 0,
+                    blockBufferOut: &block), kCMBlockBufferNoErr)
+                let buffer = try XCTUnwrap(block)
+                samples.withUnsafeBytes { raw in
+                    _ = CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: buffer,
+                        offsetIntoDestination: 0, dataLength: byteCount)
+                }
+                var sampleBuffer: CMSampleBuffer?
+                let pts = CMTime(value: Int64(audioOffset), timescale: 44_100)
+                XCTAssertEqual(CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault,
+                    dataBuffer: buffer, formatDescription: audioFormat, sampleCount: count,
+                    presentationTimeStamp: pts, packetDescriptions: nil, sampleBufferOut: &sampleBuffer), noErr)
+                XCTAssertTrue(audioInput.append(try XCTUnwrap(sampleBuffer)))
+                audioOffset += count
+                if audioOffset >= totalAudioSamples {
+                    audioInput.markAsFinished()
+                    audioFinished = true
+                }
+                progressed = true
+            }
+            if !progressed { try await Task.sleep(for: .milliseconds(2)) }
+        }
+        XCTAssertTrue(videoFinished && audioFinished, "Timed out writing synthetic 24 fps clip (video=\(videoIndex)/\(totalVideoFrames) audio=\(audioOffset)/\(totalAudioSamples) status=\(writer.status.rawValue) err=\(String(describing: writer.error)))")
+        await writer.finishWriting()
+        XCTAssertEqual(writer.status, .completed, "Synthetic 24 fps clip write failed: \(String(describing: writer.error))")
+        return url
+    }
+
     private func isolatedDecoder(position: Double, rate: Double) async throws -> (IsolatedVideoRecovery, CMTimebase) {
         let url = try XCTUnwrap(Bundle(for: PictureRecoveryTests.self).url(forResource: "test-motion-60", withExtension: "mp4"))
         let decoder = try await IsolatedVideoRecovery.prepare(from: AVPlayerItem(url: url))
@@ -1072,8 +1398,10 @@ private final class PictureRecoveryFixture {
 
     init(test: XCTestCase, nativeAudio: Bool = false,
          firstResourceName: String = "test-selection-a", firstDuration: Double = 30,
+         customFirstURL: URL? = nil,
          otherResourceName: String = "test-selection-b", otherDuration: Double = 30,
-         actualSessionActivation: Bool = false) async throws {
+         actualSessionActivation: Bool = false,
+         seekVideo: PlaybackService.SeekVideo? = nil) async throws {
         let activation = PictureActivationProbe(actual: actualSessionActivation)
         activationProbe = activation
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1081,8 +1409,11 @@ private final class PictureRecoveryFixture {
         let cloud = OneDriveClient(account: MicrosoftAccount())
         let downloads = try OfflineDownloads(cloud: cloud, network: NetworkStatus(), debugLocalRoot: directory)
         let library = LibraryRepository(cloud: cloud, catalogURL: directory.appendingPathComponent("catalog.json"))
-        for (key, name) in [(mediaID, firstResourceName), (otherID, otherResourceName)] {
-            let source = try XCTUnwrap(Bundle(for: PictureRecoveryTests.self).url(forResource: name, withExtension: "mp4"))
+        let firstSource: URL
+        if let customFirstURL { firstSource = customFirstURL }
+        else { firstSource = try XCTUnwrap(Bundle(for: PictureRecoveryTests.self).url(forResource: firstResourceName, withExtension: "mp4")) }
+        let otherSource = try XCTUnwrap(Bundle(for: PictureRecoveryTests.self).url(forResource: otherResourceName, withExtension: "mp4"))
+        for (key, source) in [(mediaID, firstSource), (otherID, otherSource)] {
             _ = try await downloads.importLocal(source, mediaID: key)
         }
         try library.install(LibraryCatalog(libraryID: "local:picture-recovery", media: [
@@ -1093,6 +1424,10 @@ private final class PictureRecoveryFixture {
             service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
                 bookmarkURL: directory.appendingPathComponent("playback.json"), activateSession: { try activation.activate() },
                 preparePCM: { _, _, _, _ in throw ContinuousPCMDecoder.Failure.unsupportedPCM })
+        } else if let seekVideo {
+            service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
+                bookmarkURL: directory.appendingPathComponent("playback.json"), activateSession: { try activation.activate() },
+                seekVideo: seekVideo)
         } else {
             service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
                 bookmarkURL: directory.appendingPathComponent("playback.json"), activateSession: { try activation.activate() })
