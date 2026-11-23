@@ -11,18 +11,21 @@ import subprocess
 import sys
 import tempfile
 SOURCE_BASE = "7d30dccbdaf8d909c1076c26e300f79bff3192ad"
-SOURCE = "91d2a4126400fa3aed51ddd3b10fa89e24ad5c94"
-APP_TREE = "e4a29891959488c7d4586316de2836800c98b60b"
+SOURCE = "ce8553dfceb8416f7b4272dea57b91c2cc1a9f78"
+APP_TREE = "5ef88f4b60f6d1e95c4f069368984e0ee8dbe2d4"
 BASE_APP_TREE = "c47520346fd94f10b0f046e5cc69d4e35686a58a"
-CORE_TREE = "b672024572648e467804011d8f270c2177ec7c6b"
+CORE_TREE = "df5967f6b3341b21da56e2bd02d5c9b1948bf8a2"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
     '.github/workflows/loop-picture-recovery.yml',
     'ios/OfflineTikTokPlayer/Playback/ContinuousPictureInPicture.swift',
     'ios/OfflineTikTokPlayer/Playback/IsolatedVideoRecovery.swift',
     'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
+    'ios/OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests.swift',
     'ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift',
+    'ios/PlayerCore/Sources/PlayerCore/NativeVideoCoverage.swift',
     'ios/PlayerCore/Sources/PlayerCore/VideoClockSync.swift',
+    'ios/PlayerCore/Tests/PlayerCoreTests/NativeVideoCoverageTests.swift',
     'ios/PlayerCore/Tests/PlayerCoreTests/VideoClockSyncTests.swift',
 )
 REPOSITORY = "Galaxybigbird/OfflineTikTokPlayer-public"
@@ -243,7 +246,7 @@ NATIVE_PROOFS = (
     (44491036531, "c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf", ".github/workflows/loop-picture-recovery.yml", "codex/personal-playback-verified"),
     (44679911846, "05c050661162801d911254582f94d7f778ad4b76", ".github/workflows/loop-picture-recovery.yml", "codex/restore-video-queue"),
     (44717676441, SOURCE_BASE, ".github/workflows/loop-picture-recovery.yml", "codex/verify-current-player-startup"),
-    (45045299298, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/smooth-synced-video"),
+    (45126640664, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/smooth-video-fix"),
 )
 
 
