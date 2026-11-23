@@ -10,23 +10,19 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "7d30dccbdaf8d909c1076c26e300f79bff3192ad"
-SOURCE = "ce8553dfceb8416f7b4272dea57b91c2cc1a9f78"
-APP_TREE = "5ef88f4b60f6d1e95c4f069368984e0ee8dbe2d4"
-BASE_APP_TREE = "c47520346fd94f10b0f046e5cc69d4e35686a58a"
-CORE_TREE = "df5967f6b3341b21da56e2bd02d5c9b1948bf8a2"
+SOURCE_BASE = "ce8553dfceb8416f7b4272dea57b91c2cc1a9f78"
+SOURCE = "afad5c9e6fbb25d7cbd53d58033da912ea096ddc"
+APP_TREE = "a0e4b4878818255cfed9a47eb1069132348d544e"
+BASE_APP_TREE = "5ef88f4b60f6d1e95c4f069368984e0ee8dbe2d4"
+CORE_TREE = "06e27eff5bf10347fe43a1178a589d0a59f40470"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
     '.github/workflows/loop-picture-recovery.yml',
-    'ios/OfflineTikTokPlayer/Playback/ContinuousPictureInPicture.swift',
-    'ios/OfflineTikTokPlayer/Playback/IsolatedVideoRecovery.swift',
     'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
-    'ios/OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests.swift',
-    'ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift',
-    'ios/PlayerCore/Sources/PlayerCore/NativeVideoCoverage.swift',
-    'ios/PlayerCore/Sources/PlayerCore/VideoClockSync.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/NativeVideoCoverageTests.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/VideoClockSyncTests.swift',
+    'ios/OfflineTikTokPlayer/UI/FeedView.swift',
+    'ios/OfflineTikTokPlayer/UI/LibraryView.swift',
+    'ios/PlayerCore/Sources/PlayerCore/PersonalLibrary.swift',
+    'ios/PlayerCore/Tests/PlayerCoreTests/PersonalLibraryTests.swift',
 )
 REPOSITORY = "Galaxybigbird/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -245,8 +241,9 @@ NATIVE_PROOFS = (
     (43703259303, "566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36", ".github/workflows/loop-picture-recovery.yml", "codex/verified-loop-picture"),
     (44491036531, "c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf", ".github/workflows/loop-picture-recovery.yml", "codex/personal-playback-verified"),
     (44679911846, "05c050661162801d911254582f94d7f778ad4b76", ".github/workflows/loop-picture-recovery.yml", "codex/restore-video-queue"),
-    (44717676441, SOURCE_BASE, ".github/workflows/loop-picture-recovery.yml", "codex/verify-current-player-startup"),
-    (45126640664, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/smooth-video-fix"),
+    (44717676441, "7d30dccbdaf8d909c1076c26e300f79bff3192ad", ".github/workflows/loop-picture-recovery.yml", "codex/verify-current-player-startup"),
+    (45126640664, SOURCE_BASE, ".github/workflows/loop-picture-recovery.yml", "codex/smooth-video-fix"),
+    (45216759712, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/library-ui-overhaul"),
 )
 
 

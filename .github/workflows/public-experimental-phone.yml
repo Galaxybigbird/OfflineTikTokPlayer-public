@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only smooth video sync and framerate repair
+run-name: Owner-only Library UI overhaul and in-player switcher
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +48,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ce8553dfceb8416f7b4272dea57b91c2cc1a9f78
+          ref: afad5c9e6fbb25d7cbd53d58033da912ea096ddc
           fetch-depth: 2
           path: candidate
           persist-credentials: false
@@ -79,7 +79,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ce8553dfceb8416f7b4272dea57b91c2cc1a9f78
+          ref: afad5c9e6fbb25d7cbd53d58033da912ea096ddc
           fetch-depth: 2
           path: candidate
           persist-credentials: false
